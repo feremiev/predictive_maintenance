@@ -1358,6 +1358,23 @@ data_section = html.Div(
             "Data explorer",
             id="data",
         ),
+
+        # ==========================================================
+        # Training data
+        # ==========================================================
+
+        html.H4(
+            "Training data",
+            className="mt-4",
+        ),
+
+        html.P(
+            "Training files contain complete motor histories until failure. "
+            "RUL can therefore be calculated directly from each motor's "
+            "maximum cycle.",
+            className="text-secondary",
+        ),
+
         dbc.Row(
             [
                 dbc.Col(
@@ -1374,6 +1391,7 @@ data_section = html.Div(
                 ),
             ]
         ),
+
         card(
             "Training dataset preview",
             dash_table.DataTable(
@@ -1395,14 +1413,102 @@ data_section = html.Div(
                 },
             ),
         ),
+
         html.Div(
             id="preview-status",
+            className="mt-3",
+        ),
+
+        # ==========================================================
+        # Official test data
+        # ==========================================================
+
+        html.Hr(
+            className="my-5",
+        ),
+
+        html.H4(
+            "Official test data with derived RUL",
+        ),
+
+        html.P(
+            "The official RUL file contains one value per motor at its "
+            "last recorded test cycle. The dashboard derives the true RUL "
+            "for every earlier test cycle.",
+            className="text-secondary",
+        ),
+
+        dbc.Alert(
+            [
+                html.Strong("RUL calculation: "),
+                html.Code(
+                    "max_observed_cycle + official_final_RUL - current_cycle"
+                ),
+            ],
+            color="info",
+            className="small",
+        ),
+
+        dbc.Row(
+            [
+                dbc.Col(
+                    dcc.Graph(
+                        id="test-rul-distribution",
+                    ),
+                    lg=6,
+                ),
+                dbc.Col(
+                    dcc.Graph(
+                        id="test-motor-length-graph",
+                    ),
+                    lg=6,
+                ),
+            ]
+        ),
+
+        card(
+            "Test dataset preview with official RUL information",
+            dash_table.DataTable(
+                id="test-data-table",
+                page_size=15,
+                sort_action="native",
+                filter_action="native",
+                style_table={
+                    "overflowX": "auto",
+                },
+                style_cell={
+                    "padding": "7px",
+                    "fontFamily": "monospace",
+                    "fontSize": "0.82rem",
+                    "minWidth": "85px",
+                    "maxWidth": "180px",
+                    "overflow": "hidden",
+                    "textOverflow": "ellipsis",
+                },
+                style_data_conditional=[
+                    {
+                        "if": {
+                            "column_id": "RUL",
+                        },
+                        "fontWeight": "bold",
+                    },
+                    {
+                        "if": {
+                            "column_id": "official_final_RUL",
+                        },
+                        "fontWeight": "bold",
+                    },
+                ],
+            ),
+        ),
+
+        html.Div(
+            id="test-preview-status",
             className="mt-3",
         ),
     ],
     className="content-section",
 )
-
 
 # =====================================================================
 # Complete layout
@@ -2416,6 +2522,7 @@ def run_external_test(
 # =====================================================================
 
 @callback(
+    # Training data outputs
     Output(
         "data-table",
         "data",
@@ -2436,6 +2543,29 @@ def run_external_test(
         "preview-status",
         "children",
     ),
+
+    # Test data outputs
+    Output(
+        "test-data-table",
+        "data",
+    ),
+    Output(
+        "test-data-table",
+        "columns",
+    ),
+    Output(
+        "test-rul-distribution",
+        "figure",
+    ),
+    Output(
+        "test-motor-length-graph",
+        "figure",
+    ),
+    Output(
+        "test-preview-status",
+        "children",
+    ),
+
     Input(
         "preview-data",
         "n_clicks",
@@ -2491,20 +2621,47 @@ def preview_data(
     if not n_clicks:
         raise PreventUpdate
 
+    empty_training_rul = empty_figure(
+        "Training RUL distribution"
+    )
+
+    empty_training_lengths = empty_figure(
+        "Training motor lengths"
+    )
+
+    empty_test_rul = empty_figure(
+        "Test RUL distribution"
+    )
+
+    empty_test_lengths = empty_figure(
+        "Test motor lengths"
+    )
+
     if IMPORT_ERROR:
+        error_alert = dbc.Alert(
+            IMPORT_ERROR,
+            color="danger",
+        )
+
         return (
             [],
             [],
-            empty_figure("RUL distribution"),
-            empty_figure("Motor lengths"),
-            dbc.Alert(
-                IMPORT_ERROR,
-                color="danger",
-            ),
+            empty_training_rul,
+            empty_training_lengths,
+            error_alert,
+            [],
+            [],
+            empty_test_rul,
+            empty_test_lengths,
+            error_alert,
         )
 
     try:
-        frame = SERVICE.load_training_data(
+        # ==========================================================
+        # Load training data
+        # ==========================================================
+
+        training_frame = SERVICE.load_training_data(
             data_folder=data_folder,
             datasets=datasets,
             remove_nulls=remove_nulls,
@@ -2512,70 +2669,194 @@ def preview_data(
             rul_cap=int(rul_cap),
         )
 
-        preview = frame.head(500)
+        training_preview = training_frame.head(500)
 
-        columns = [
+        training_columns = [
             {
                 "name": column,
                 "id": column,
             }
-            for column in preview.columns
+            for column in training_preview.columns
         ]
 
-        rul_figure = px.histogram(
-            frame,
+        training_rul_figure = px.histogram(
+            training_frame,
             x="RUL",
+            color="dataset",
             nbins=50,
             title="Training RUL distribution",
+            marginal="box",
         )
 
-        lengths = (
-            frame.groupby(
-                "unique_motor_id"
+        training_lengths = (
+            training_frame.groupby(
+                [
+                    "dataset",
+                    "unique_motor_id",
+                ],
+                as_index=False,
             )
             .size()
-            .rename("cycles")
-            .reset_index()
+            .rename(
+                columns={
+                    "size": "cycles",
+                }
+            )
         )
 
-        motor_figure = px.histogram(
-            lengths,
+        training_motor_figure = px.histogram(
+            training_lengths,
             x="cycles",
+            color="dataset",
             nbins=40,
-            title=(
-                "Distribution of training motor history lengths"
-            ),
+            title="Training motor history lengths",
         )
 
-        status = dbc.Alert(
+        training_status = dbc.Alert(
             (
-                f"Loaded {len(frame):,} rows and "
-                f"{frame['unique_motor_id'].nunique():,} motors."
+                f"Training: loaded {len(training_frame):,} rows and "
+                f"{training_frame['unique_motor_id'].nunique():,} motors."
+            ),
+            color="success",
+        )
+
+        # ==========================================================
+        # Load test data and attach RUL
+        # ==========================================================
+
+        test_frame = SERVICE.load_test_data_with_rul(
+            data_folder=data_folder,
+            datasets=datasets,
+            remove_nulls=remove_nulls,
+            clip_rul=clip_rul,
+            rul_cap=int(rul_cap),
+        )
+
+        # Put the identification and RUL columns first so they are easier
+        # to inspect in the horizontally scrollable table.
+        preferred_columns = [
+            "dataset",
+            "unique_motor_id",
+            "unit_number",
+            "cycle",
+            "max_observed_cycle",
+            "official_final_RUL",
+            "RUL",
+        ]
+
+        remaining_columns = [
+            column
+            for column in test_frame.columns
+            if column not in preferred_columns
+        ]
+
+        test_frame = test_frame[
+            preferred_columns + remaining_columns
+        ]
+
+        test_preview = test_frame.head(500)
+
+        test_columns = [
+            {
+                "name": column,
+                "id": column,
+            }
+            for column in test_preview.columns
+        ]
+
+        test_rul_figure = px.histogram(
+            test_frame,
+            x="RUL",
+            color="dataset",
+            nbins=50,
+            title="Derived RUL distribution in official test histories",
+            marginal="box",
+        )
+
+        test_lengths = (
+            test_frame.groupby(
+                [
+                    "dataset",
+                    "unique_motor_id",
+                ],
+                as_index=False,
+            )
+            .size()
+            .rename(
+                columns={
+                    "size": "cycles",
+                }
+            )
+        )
+
+        test_motor_figure = px.histogram(
+            test_lengths,
+            x="cycles",
+            color="dataset",
+            nbins=40,
+            title="Official test motor history lengths",
+        )
+
+        test_status = dbc.Alert(
+            (
+                f"Official test: loaded {len(test_frame):,} rows and "
+                f"{test_frame['unique_motor_id'].nunique():,} motors. "
+                "RUL was derived for every recorded cycle."
             ),
             color="success",
         )
 
         return (
-            preview.to_dict("records"),
-            columns,
-            rul_figure,
-            motor_figure,
-            status,
+            # Training
+            training_preview.to_dict("records"),
+            training_columns,
+            training_rul_figure,
+            training_motor_figure,
+            training_status,
+
+            # Test
+            test_preview.to_dict("records"),
+            test_columns,
+            test_rul_figure,
+            test_motor_figure,
+            test_status,
         )
 
     except Exception as exc:
+        trace = traceback.format_exc()
+
+        error_alert = dbc.Alert(
+            [
+                html.Strong(
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                html.Details(
+                    [
+                        html.Summary(
+                            "Show traceback"
+                        ),
+                        html.Pre(
+                            trace,
+                            className="traceback",
+                        ),
+                    ]
+                ),
+            ],
+            color="danger",
+        )
+
         return (
             [],
             [],
-            empty_figure("RUL distribution"),
-            empty_figure("Motor lengths"),
-            dbc.Alert(
-                f"{type(exc).__name__}: {exc}",
-                color="danger",
-            ),
+            empty_training_rul,
+            empty_training_lengths,
+            error_alert,
+            [],
+            [],
+            empty_test_rul,
+            empty_test_lengths,
+            error_alert,
         )
-
-
 # =====================================================================
 # Saved experiments callbacks
 # =====================================================================
@@ -3071,4 +3352,9 @@ def load_saved_experiment(
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(
+        host="0.0.0.0",
+        port=8051,
+        debug=True,
+        use_reloader=False,
+    )

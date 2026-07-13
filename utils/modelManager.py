@@ -288,9 +288,18 @@ class ExperimentManager:
             model_family=model_family,
         )
 
-        scaler = self._load_optional_joblib(
-            experiment_folder / "scaler.joblib"
+        preprocessor = self._load_optional_joblib(
+            experiment_folder
+            / "preprocessor.joblib"
         )
+
+        # Backward compatibility with experiments created before the
+        # CMapssPreprocessor integration.
+        if preprocessor is None:
+            preprocessor = self._load_optional_joblib(
+                experiment_folder
+                / "scaler.joblib"
+            )
         history = self._load_optional_csv(
             experiment_folder / "history.csv"
         )
@@ -340,7 +349,7 @@ class ExperimentManager:
             config=config,
             metrics=metrics,
             model=model,
-            scaler=scaler,
+            scaler=preprocessor,
             history=history,
             train_predictions=train_predictions,
             validation_predictions=validation_predictions,
@@ -930,17 +939,52 @@ class ExperimentManager:
         experiment: Any,
         experiment_folder: Path,
     ) -> None:
-        scaler = getattr(
+        """
+        Save the fitted preprocessing object.
+
+        Priority:
+        1. Sequence model fitted_preprocessor
+        2. Preprocessor contained in an sklearn pipeline
+        3. Legacy scaler attribute
+        """
+        preprocessor = getattr(
             experiment,
-            "scaler",
+            "fitted_preprocessor",
             None,
         )
 
-        if scaler is not None:
+        # Tabular sklearn models already contain the fitted preprocessor
+        # inside pipeline.joblib, but saving it separately is useful and keeps
+        # loading behavior consistent with sequence models.
+        if preprocessor is None:
+            pipeline = getattr(
+                experiment,
+                "pipeline",
+                None,
+            )
+
+            if (
+                pipeline is not None
+                and hasattr(pipeline, "named_steps")
+                and "preprocessor" in pipeline.named_steps
+            ):
+                preprocessor = pipeline.named_steps[
+                    "preprocessor"
+                ]
+
+        # Backward compatibility with older model classes.
+        if preprocessor is None:
+            preprocessor = getattr(
+                experiment,
+                "scaler",
+                None,
+            )
+
+        if preprocessor is not None:
             joblib.dump(
-                scaler,
+                preprocessor,
                 experiment_folder
-                / "scaler.joblib",
+                / "preprocessor.joblib",
             )
 
     def _save_training_history(
@@ -1044,42 +1088,95 @@ class ExperimentManager:
             )
 
     def _save_feature_names(
-        self,
-        experiment: Any,
-        experiment_folder: Path,
-    ) -> None:
-        feature_names = None
+            self,
+            experiment: Any,
+            experiment_folder: Path,
+        ) -> None:
+            """
+            Save the final feature names consumed by the model.
 
-        if getattr(
-            experiment,
-            "feature_columns",
-            None,
-        ) is not None:
-            feature_names = list(
-                experiment.feature_columns
+            For sequence models, these are the processed columns after scaling and
+            operating-condition encoding.
+            """
+            feature_names = None
+
+            processed_feature_names = getattr(
+                experiment,
+                "processed_feature_columns_",
+                None,
             )
 
-        elif getattr(
-            experiment,
-            "X_train",
-            None,
-        ) is not None:
-            X_train = experiment.X_train
-
-            if isinstance(
-                X_train,
-                pd.DataFrame,
-            ):
+            if processed_feature_names:
                 feature_names = list(
-                    X_train.columns
+                    processed_feature_names
                 )
 
-        if feature_names is not None:
-            self._write_json(
-                experiment_folder
-                / "feature_names.json",
-                feature_names,
-            )
+            elif getattr(
+                experiment,
+                "feature_columns",
+                None,
+            ) is not None:
+                feature_names = list(
+                    experiment.feature_columns
+                )
+
+            elif getattr(
+                experiment,
+                "X_train",
+                None,
+            ) is not None:
+                X_train = experiment.X_train
+
+                if isinstance(
+                    X_train,
+                    pd.DataFrame,
+                ):
+                    feature_names = list(
+                        X_train.columns
+                    )
+
+            # Tabular sklearn pipeline fallback.
+            if feature_names is None:
+                pipeline = getattr(
+                    experiment,
+                    "pipeline",
+                    None,
+                )
+
+                if (
+                    pipeline is not None
+                    and hasattr(pipeline, "named_steps")
+                    and "preprocessor" in pipeline.named_steps
+                ):
+                    fitted_preprocessor = (
+                        pipeline.named_steps[
+                            "preprocessor"
+                        ]
+                    )
+
+                    if hasattr(
+                        fitted_preprocessor,
+                        "get_feature_names_out",
+                    ):
+                        try:
+                            feature_names = list(
+                                fitted_preprocessor
+                                .get_feature_names_out()
+                            )
+                        except (
+                            AttributeError,
+                            RuntimeError,
+                            ValueError,
+                        ):
+                            feature_names = None
+
+            if feature_names is not None:
+                self._write_json(
+                    experiment_folder
+                    / "feature_names.json",
+                    feature_names,
+                )
+
 
     def _save_group_ids(
         self,
@@ -1486,6 +1583,7 @@ class LoadedExperiment:
         self.metrics = metrics
         self.model = model
         self.scaler = scaler
+        self.preprocessor = scaler
         self.history = history
         self.train_predictions = train_predictions
         self.validation_predictions = (

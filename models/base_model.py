@@ -28,6 +28,10 @@ from xgboost import XGBRegressor
 from pathlib import Path
 from typing import Callable, Sequence, Union
 
+from sklearn.base import clone
+
+from preprocessors.cmapss_preprocessor import CMapssPreprocessor
+
 class TimeSeriesRegressionModel:
     """
     Regression class for datasets containing multiple independent time series.
@@ -84,6 +88,7 @@ class TimeSeriesRegressionModel:
         columns_to_drop: Optional[list[str]] = None,
         random_state: int = 42,
         model_params: Optional[dict[str, Any]] = None,
+        preprocessor=None,
     ) -> None:
         """
         Parameters
@@ -194,6 +199,14 @@ class TimeSeriesRegressionModel:
 
         self._validate_configuration()
 
+        self.preprocessor = (
+            preprocessor
+            if preprocessor is not None
+            else CMapssPreprocessor()
+        )
+
+        self.fitted_preprocessor = None
+
     # ==========================================================
     # Validation and preparation
     # ==========================================================
@@ -262,8 +275,38 @@ class TimeSeriesRegressionModel:
 
     def _feature_columns(self) -> list[str]:
         """
-        Return columns used as model inputs.
+        Return the raw features expected by the preprocessor.
         """
+
+        if self.preprocessor is not None:
+            expected = list(
+                self.preprocessor.correct_order_
+            )
+
+            condition_encoder = getattr(
+                self.preprocessor,
+                "operating_condition_encoder",
+                None,
+            )
+
+            if condition_encoder is not None:
+                condition_column = condition_encoder.column
+
+                if condition_column not in expected:
+                    expected.append(condition_column)
+
+            missing = set(expected).difference(
+                self.df.columns
+            )
+
+            if missing:
+                raise ValueError(
+                    "The DataFrame is missing required features: "
+                    f"{sorted(missing)}"
+                )
+
+            return expected
+
         excluded_columns = {
             self.target_column,
             self.group_column,
@@ -275,7 +318,6 @@ class TimeSeriesRegressionModel:
             for column in self.df.columns
             if column not in excluded_columns
         ]
-
     # ==========================================================
     # Model factory
     # ==========================================================
@@ -400,34 +442,28 @@ class TimeSeriesRegressionModel:
 
     def _create_pipeline(self) -> Pipeline:
         """
-        Create the complete preprocessing and model pipeline.
+        Create the model pipeline using the custom C-MAPSS preprocessor.
         """
         estimator = self._create_estimator()
 
-        scaler: StandardScaler | str
-
-        if self._model_requires_scaling():
-            scaler = StandardScaler()
-        else:
-            scaler = "passthrough"
-
-        return Pipeline(
-            steps=[
-                (
-                    "imputer",
-                    SimpleImputer(strategy="median"),
-                ),
-                (
-                    "scaler",
-                    scaler,
-                ),
+        if self.preprocessor is None:
+            return Pipeline([
                 (
                     "model",
                     estimator,
-                ),
-            ]
-        )
+                )
+            ])
 
+        return Pipeline([
+            (
+                "preprocessor",
+                clone(self.preprocessor),
+            ),
+            (
+                "model",
+                estimator,
+            ),
+        ])
     # ==========================================================
     # Train/validation split by complete series
     # ==========================================================

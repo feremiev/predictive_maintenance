@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from preprocessors.cmapss_preprocessor import CMapssPreprocessor
+
 
 
 # =====================================================================
@@ -347,6 +349,71 @@ class ExperimentService:
 
         return folder.resolve()
 
+
+    @staticmethod
+    def _add_operating_condition(
+        dataframe: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """
+        Create a deterministic operating-condition category from the three
+        C-MAPSS operating settings.
+
+        The same transformation must be used for training, validation, and
+        official test data.
+
+        Rounding prevents tiny floating-point differences from creating
+        unnecessarily different categories.
+        """
+        required_columns = {
+            "setting_1",
+            "setting_2",
+            "setting_3",
+        }
+
+        missing = required_columns.difference(
+            dataframe.columns
+        )
+
+        if missing:
+            raise ValueError(
+                "Cannot create operating_condition. "
+                f"Missing settings: {sorted(missing)}"
+            )
+
+        result = dataframe.copy()
+
+        setting_1 = (
+            result["setting_1"]
+            .astype(float)
+            .round(1)
+            .astype(str)
+        )
+
+        setting_2 = (
+            result["setting_2"]
+            .astype(float)
+            .round(3)
+            .astype(str)
+        )
+
+        setting_3 = (
+            result["setting_3"]
+            .astype(float)
+            .round(0)
+            .astype(int)
+            .astype(str)
+        )
+
+        result["operating_condition"] = (
+            setting_1
+            + "_"
+            + setting_2
+            + "_"
+            + setting_3
+        )
+
+        return result
+
     # =================================================================
     # Data loading
     # =================================================================
@@ -409,8 +476,226 @@ class ExperimentService:
                 "The selected training files produced an empty DataFrame."
             )
 
+        frame = self._add_operating_condition(
+            frame
+        )
+
         return frame
 
+
+    def load_test_data_with_rul(
+        self,
+        data_folder: str | Path,
+        datasets: list[str],
+        remove_nulls: bool = True,
+        clip_rul: bool = False,
+        rul_cap: int = 125,
+    ) -> pd.DataFrame:
+        """
+        Load C-MAPSS test files and attach the true RUL to every test row.
+
+        The official RUL file contains one value per motor. That value represents
+        the remaining useful life after the final cycle recorded in test_FDxxx.
+
+        Row-level RUL is calculated as:
+
+            max_observed_cycle
+            + official_final_RUL
+            - current_cycle
+
+        Parameters
+        ----------
+        data_folder:
+            Folder containing test_FDxxx.txt and RUL_FDxxx.txt.
+
+        datasets:
+            Dataset identifiers such as ["FD001", "FD002"].
+
+        remove_nulls:
+            Remove rows containing null values.
+
+        clip_rul:
+            Whether to cap the derived RUL.
+
+        rul_cap:
+            Maximum RUL when clipping is enabled.
+
+        Returns
+        -------
+        pd.DataFrame
+            Combined test dataset with official and row-level RUL information.
+        """
+        folder = Path(data_folder)
+
+        if not folder.exists():
+            raise FileNotFoundError(
+                f"Data folder does not exist: {folder.resolve()}"
+            )
+
+        if not datasets:
+            raise ValueError(
+                "Select at least one test dataset."
+            )
+
+        column_names = [
+            "unit_number",
+            "cycle",
+            "setting_1",
+            "setting_2",
+            "setting_3",
+        ] + [
+            f"sensor_{number}"
+            for number in range(1, 22)
+        ]
+
+        all_test_frames = []
+
+        for dataset_name in datasets:
+            dataset_name = dataset_name.upper().strip()
+
+            test_path = folder / f"test_{dataset_name}.txt"
+            rul_path = folder / f"RUL_{dataset_name}.txt"
+
+            if not test_path.is_file():
+                raise FileNotFoundError(
+                    f"Test file was not found: {test_path}"
+                )
+
+            if not rul_path.is_file():
+                raise FileNotFoundError(
+                    f"RUL file was not found: {rul_path}"
+                )
+
+            # ----------------------------------------------------------
+            # Load test sensor history
+            # ----------------------------------------------------------
+
+            test_df = pd.read_csv(
+                test_path,
+                sep=r"\s+",
+                header=None,
+                names=column_names,
+            )
+
+            test_df["dataset"] = dataset_name
+
+            test_df["unique_motor_id"] = (
+                test_df["dataset"]
+                + "_"
+                + test_df["unit_number"].astype(str)
+            )
+
+            # ----------------------------------------------------------
+            # Load official RUL values
+            # ----------------------------------------------------------
+            # The first RUL row corresponds to unit 1, the second to unit 2,
+            # and so on inside each FD dataset.
+
+            rul_df = pd.read_csv(
+                rul_path,
+                sep=r"\s+",
+                header=None,
+                names=["official_final_RUL"],
+            )
+
+            rul_df["unit_number"] = (
+                np.arange(len(rul_df)) + 1
+            )
+
+            rul_df["dataset"] = dataset_name
+
+            rul_df["unique_motor_id"] = (
+                rul_df["dataset"]
+                + "_"
+                + rul_df["unit_number"].astype(str)
+            )
+
+            motor_count = test_df["unit_number"].nunique()
+
+            if len(rul_df) != motor_count:
+                raise ValueError(
+                    f"{dataset_name} contains {motor_count} test motors, "
+                    f"but {rul_path.name} contains {len(rul_df)} RUL values."
+                )
+
+            # ----------------------------------------------------------
+            # Get the final observed cycle for every motor
+            # ----------------------------------------------------------
+
+            maximum_cycles = (
+                test_df.groupby(
+                    "unique_motor_id",
+                    as_index=False,
+                )["cycle"]
+                .max()
+                .rename(
+                    columns={
+                        "cycle": "max_observed_cycle",
+                    }
+                )
+            )
+
+            # ----------------------------------------------------------
+            # Attach official RUL and maximum cycle to every test row
+            # ----------------------------------------------------------
+
+            test_df = test_df.merge(
+                rul_df[
+                    [
+                        "unique_motor_id",
+                        "official_final_RUL",
+                    ]
+                ],
+                on="unique_motor_id",
+                how="left",
+                validate="many_to_one",
+            )
+
+            test_df = test_df.merge(
+                maximum_cycles,
+                on="unique_motor_id",
+                how="left",
+                validate="many_to_one",
+            )
+
+            # ----------------------------------------------------------
+            # Calculate true RUL for every recorded test cycle
+            # ----------------------------------------------------------
+
+            test_df["RUL"] = (
+                test_df["max_observed_cycle"]
+                + test_df["official_final_RUL"]
+                - test_df["cycle"]
+            )
+
+            if clip_rul:
+                test_df["RUL"] = test_df["RUL"].clip(
+                    upper=rul_cap
+                )
+
+            if remove_nulls:
+                test_df = test_df.dropna().copy()
+
+            all_test_frames.append(test_df)
+
+        combined_test = pd.concat(
+            all_test_frames,
+            ignore_index=True,
+        )
+
+        combined_test = combined_test.sort_values(
+            [
+                "dataset",
+                "unit_number",
+                "cycle",
+            ]
+        ).reset_index(drop=True)
+
+        combined_test = self._add_operating_condition(
+            combined_test
+        )
+
+        return combined_test
     # =================================================================
     # Development experiment execution
     # =================================================================
@@ -572,6 +857,8 @@ class ExperimentService:
             "model_params": config[
                 "model_params"
             ],
+            "preprocessor": CMapssPreprocessor(),
+
         }
 
         return self._construct_with_supported_kwargs(
@@ -665,6 +952,7 @@ class ExperimentService:
                 "patience"
             ],
             **architecture_parameters,
+            "preprocessor": CMapssPreprocessor(),
         }
 
         return self._construct_with_supported_kwargs(
@@ -788,6 +1076,7 @@ class ExperimentService:
                     rul_clip_value=int(
                         rul_cap
                     ),
+                    preprocess_fn=self._add_operating_condition,
                 )
             )
 
@@ -819,6 +1108,7 @@ class ExperimentService:
                     rul_clip_value=int(
                         rul_cap
                     ),
+                    preprocess_fn=self._add_operating_condition,
                 )
             )
 
@@ -904,6 +1194,7 @@ class ExperimentService:
                 "random_state",
                 42,
             ),
+            "preprocessor": CMapssPreprocessor(),
         }
 
         wrapper = self._construct_with_supported_kwargs(
@@ -1139,6 +1430,7 @@ class ExperimentService:
                 True,
             ),
             "verbose": 0,
+            "preprocessor": CMapssPreprocessor(),
         }
 
         wrapper = self._construct_with_supported_kwargs(
@@ -1147,8 +1439,34 @@ class ExperimentService:
         )
 
         wrapper.model = loaded.model
-        wrapper.scaler = loaded.scaler
+        wrapper.fitted_preprocessor = getattr(
+            loaded,
+            "preprocessor",
+            None,
+        )
 
+        if wrapper.fitted_preprocessor is None:
+            wrapper.fitted_preprocessor = getattr(
+                loaded,
+                "scaler",
+                None,
+            )
+
+        if wrapper.fitted_preprocessor is None:
+            raise RuntimeError(
+                "The saved sequence experiment does not contain its fitted "
+                "C-MAPSS preprocessor."
+            )
+
+        wrapper.processed_feature_columns_ = list(
+            loaded.feature_names or []
+        )
+
+        if not wrapper.processed_feature_columns_:
+            wrapper.processed_feature_columns_ = list(
+                wrapper.fitted_preprocessor
+                .get_feature_names_out()
+            )
         return wrapper
 
     # =================================================================

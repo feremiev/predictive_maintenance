@@ -21,6 +21,10 @@ from sklearn.preprocessing import (
 from tensorflow import keras
 from tensorflow.keras import layers
 
+from sklearn.base import clone
+
+from preprocessors.cmapss_preprocessor import CMapssPreprocessor
+
 
 class SequenceRULModel:
     """
@@ -162,6 +166,9 @@ class SequenceRULModel:
         min_learning_rate: float = 1e-6,
         shuffle_windows: bool = True,
         verbose: int = 1,
+        preprocessor=None,
+
+
     ) -> None:
         self.df = df.copy()
 
@@ -247,6 +254,14 @@ class SequenceRULModel:
         self.external_test_metrics: Optional[dict[str, Any]] = None
 
         self._validate_configuration()
+        self.preprocessor = (
+                            preprocessor
+                            if preprocessor is not None
+                            else CMapssPreprocessor()
+        )
+
+        self.fitted_preprocessor = None
+        self.processed_feature_columns_: Optional[list[str]] = None
 
     # ==========================================================
     # Validation and feature selection
@@ -330,17 +345,62 @@ class SequenceRULModel:
 
     def _resolve_feature_columns(
         self,
-        frame: Optional[pd.DataFrame] = None,
+        dataframe: Optional[pd.DataFrame] = None,
     ) -> list[str]:
-        source = self.df if frame is None else frame
+        """
+        Return the raw input columns required by the preprocessor.
 
-        if self.feature_columns is not None:
-            missing = set(self.feature_columns).difference(source.columns)
+        These are the columns before preprocessing. The preprocessor will
+        transform them into the final numeric model features.
+        """
+        source = (
+            dataframe
+            if dataframe is not None
+            else self.df
+        )
+
+        if self.preprocessor is not None:
+            expected = list(
+                self.preprocessor.correct_order_
+            )
+
+            # CMapssPreprocessor uses OperatingConditionEncoder, so the raw
+            # operating-condition column must also be passed to it.
+            condition_encoder = getattr(
+                self.preprocessor,
+                "operating_condition_encoder",
+                None,
+            )
+
+            if condition_encoder is not None:
+                condition_column = condition_encoder.column
+
+                if condition_column not in expected:
+                    expected.append(condition_column)
+
+            missing = set(expected).difference(
+                source.columns
+            )
+
             if missing:
                 raise ValueError(
-                    f"Missing feature columns: {sorted(missing)}"
+                    "Missing sequence input features: "
+                    f"{sorted(missing)}"
                 )
-            return self.feature_columns.copy()
+
+            return expected
+
+        if self.feature_columns is not None:
+            missing = set(
+                self.feature_columns
+            ).difference(source.columns)
+
+            if missing:
+                raise ValueError(
+                    f"Missing configured features: {sorted(missing)}"
+                )
+
+            return list(self.feature_columns)
 
         excluded = {
             self.target_column,
@@ -348,16 +408,13 @@ class SequenceRULModel:
             *self.columns_to_drop,
         }
 
-        columns = [
+        return [
             column
-            for column in source.select_dtypes(include=np.number).columns
+            for column in source.select_dtypes(
+                include=np.number
+            ).columns
             if column not in excluded
         ]
-
-        if not columns:
-            raise ValueError("No numeric feature columns are available.")
-
-        return columns
 
     # ==========================================================
     # Train/validation split by complete motors
@@ -455,39 +512,170 @@ class SequenceRULModel:
 
         raise ValueError(f"Unsupported scaler: {self.scaler_name}")
 
-    def _fit_and_apply_scaler(self) -> None:
+    def _replace_raw_features(
+        self,
+        original: pd.DataFrame,
+        processed: pd.DataFrame,
+        raw_feature_columns: list[str],
+    ) -> pd.DataFrame:
         """
-        Fit the scaler only on training motors and transform validation motors
-        with the fitted training statistics.
-        """
-        feature_columns = self._resolve_feature_columns()
+        Replace raw preprocessor inputs with the processed numeric features.
 
-        self.scaler = self._create_scaler()
-        if self.scaler is None:
+        This is necessary because preprocessing can change the number of columns,
+        for example by converting operating_condition into one-hot columns.
+        """
+        result = original.drop(
+            columns=raw_feature_columns,
+            errors="ignore",
+        ).copy()
+
+        processed = processed.copy()
+        processed.index = original.index
+
+        return pd.concat(
+            [
+                result,
+                processed,
+            ],
+            axis=1,
+        )
+
+    def _fit_and_apply_preprocessor(
+        self,
+    ) -> None:
+        """
+        Fit preprocessing using training motors only.
+
+        The fitted preprocessing is then applied to validation motors without
+        fitting again, preventing data leakage.
+        """
+        raw_feature_columns = (
+            self._resolve_feature_columns(
+                self.train_df
+            )
+        )
+
+        if self.preprocessor is None:
+            self.processed_feature_columns_ = (
+                raw_feature_columns
+            )
             return
 
-        self.scaler.fit(self.train_df[feature_columns])
-
-        self.train_df.loc[:, feature_columns] = self.scaler.transform(
-            self.train_df[feature_columns]
+        self.fitted_preprocessor = clone(
+            self.preprocessor
         )
-        self.validation_df.loc[:, feature_columns] = self.scaler.transform(
-            self.validation_df[feature_columns]
+
+        # Fit only on training data.
+        self.fitted_preprocessor.fit(
+            self.train_df[
+                raw_feature_columns
+            ]
+        )
+
+        train_processed = (
+            self.fitted_preprocessor.transform(
+                self.train_df[
+                    raw_feature_columns
+                ]
+            )
+        )
+
+        validation_processed = (
+            self.fitted_preprocessor.transform(
+                self.validation_df[
+                    raw_feature_columns
+                ]
+            )
+        )
+
+        if not isinstance(
+            train_processed,
+            pd.DataFrame,
+        ):
+            train_processed = pd.DataFrame(
+                train_processed,
+                index=self.train_df.index,
+                columns=(
+                    self.fitted_preprocessor
+                    .get_feature_names_out()
+                ),
+            )
+
+        if not isinstance(
+            validation_processed,
+            pd.DataFrame,
+        ):
+            validation_processed = pd.DataFrame(
+                validation_processed,
+                index=self.validation_df.index,
+                columns=(
+                    self.fitted_preprocessor
+                    .get_feature_names_out()
+                ),
+            )
+
+        self.processed_feature_columns_ = list(
+            train_processed.columns
+        )
+
+        self.train_df = self._replace_raw_features(
+            original=self.train_df,
+            processed=train_processed,
+            raw_feature_columns=raw_feature_columns,
+        )
+
+        self.validation_df = (
+            self._replace_raw_features(
+                original=self.validation_df,
+                processed=validation_processed,
+                raw_feature_columns=raw_feature_columns,
+            )
         )
 
     def _transform_external_features(
         self,
-        external_df: pd.DataFrame,
+        df: pd.DataFrame,
     ) -> pd.DataFrame:
-        feature_columns = self._resolve_feature_columns(external_df)
-        transformed = external_df.copy()
+        """
+        Transform validation-independent or official external data using the
+        preprocessor fitted on training motors.
 
-        if self.scaler is not None:
-            transformed.loc[:, feature_columns] = self.scaler.transform(
-                transformed[feature_columns]
+        The preprocessor is never fitted again here.
+        """
+        if self.fitted_preprocessor is None:
+            raise RuntimeError(
+                "The preprocessor has not been fitted. "
+                "Train or prepare the model first."
             )
 
-        return transformed
+        raw_feature_columns = (
+            self._resolve_feature_columns(df)
+        )
+
+        processed = (
+            self.fitted_preprocessor.transform(
+                df[raw_feature_columns]
+            )
+        )
+
+        if not isinstance(
+            processed,
+            pd.DataFrame,
+        ):
+            processed = pd.DataFrame(
+                processed,
+                index=df.index,
+                columns=(
+                    self.fitted_preprocessor
+                    .get_feature_names_out()
+                ),
+            )
+
+        return self._replace_raw_features(
+            original=df,
+            processed=processed,
+            raw_feature_columns=raw_feature_columns,
+        )
 
     # ==========================================================
     # Window generation
@@ -530,7 +718,15 @@ class SequenceRULModel:
         Generate all valid training or validation windows independently
         for every motor.
         """
-        feature_columns = self._resolve_feature_columns(data)
+        if not self.processed_feature_columns_:
+            raise RuntimeError(
+                "Processed feature columns are unavailable. "
+                "Run prepare_data() first."
+            )
+
+        feature_columns = (
+            self.processed_feature_columns_
+        )
 
         X_windows: list[np.ndarray] = []
         y_values: list[float] = []
@@ -643,7 +839,15 @@ class SequenceRULModel:
         The generated sequence ends at the last observed test cycle. This is
         the standard input used to compare predictions with RUL_FD00X.txt.
         """
-        feature_columns = self._resolve_feature_columns(data)
+        if not self.processed_feature_columns_:
+            raise RuntimeError(
+                "Processed feature columns are unavailable. "
+                "Train the model before official test evaluation."
+            )
+
+        feature_columns = (
+            self.processed_feature_columns_
+        )
 
         X_windows: list[np.ndarray] = []
         metadata_rows: list[dict[str, Any]] = []
@@ -700,31 +904,37 @@ class SequenceRULModel:
             pd.DataFrame(metadata_rows),
         )
 
+
     def prepare_data(self) -> None:
         """
-        Split training-file motors, fit scaling on training motors only, and
-        create train and validation sequence windows.
+        Split complete motors, preprocess the train and validation sets,
+        and create sequence windows.
         """
         self.split_groups()
-        self._fit_and_apply_scaler()
+
+        self._fit_and_apply_preprocessor()
 
         (
             self.X_train,
             self.y_train,
             self.train_metadata,
-        ) = self._generate_windows(self.train_df)
+        ) = self._generate_windows(
+            self.train_df
+        )
 
         (
             self.X_validation,
             self.y_validation,
             self.validation_metadata,
-        ) = self._generate_windows(self.validation_df)
+        ) = self._generate_windows(
+            self.validation_df
+        )
 
-        print("\nSequence shapes:")
         print(
             f"X_train: {self.X_train.shape} | "
             f"y_train: {self.y_train.shape}"
         )
+
         print(
             f"X_validation: {self.X_validation.shape} | "
             f"y_validation: {self.y_validation.shape}"
