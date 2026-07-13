@@ -1,0 +1,22 @@
+{
+    "target_column": "RUL",
+    "group_column": "unique_motor_id",
+    "time_column": "cycle",
+    "columns_to_drop": [
+        "dataset",
+        "unit_number"
+    ],
+    "model_name": "hist_gradient_boosting",
+    "model_params": {},
+    "test_group_count": 10,
+    "test_group_size": 0.2,
+    "group_selection": "random",
+    "random_state": 42,
+    "data_folder": "raw_data",
+    "datasets": [
+        "FD001"
+    ],
+    "remove_nulls": true,
+    "clip_rul": false,
+    "rul_cap": 125
+}

@@ -1,5 +1,6 @@
 import os
 import pandas as pd
+from pathlib import Path
 
 
 ###################################################### how to use #################################################
@@ -34,6 +35,8 @@ import pandas as pd
 # )
 
 ###################################################### how to use #################################################
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 
 
 class CMAPSSDataset:
@@ -50,11 +53,12 @@ class CMAPSSDataset:
                  clip_rul=True,
                  rul_clip_value=125):
 
-        self.data_folder = data_folder
+        #self.data_folder = data_folder
         self.remove_nulls = remove_nulls
         self.create_rul = create_rul
         self.clip_rul = clip_rul
         self.rul_clip_value = rul_clip_value
+        self.data_folder = PROJECT_ROOT / data_folder
 
     ####################################################################
     # Public methods

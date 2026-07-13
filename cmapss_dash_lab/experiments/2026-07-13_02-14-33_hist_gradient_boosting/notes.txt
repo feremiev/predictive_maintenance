@@ -1,0 +1,1 @@
+Created from Dash. Datasets=['FD001']; clip_rul=False; rul_cap=125.

@@ -1,0 +1,77 @@
+
+:root {
+    --sidebar-width: 255px;
+    --page-bg: #f6f8fb;
+}
+
+body {
+    background: var(--page-bg);
+    color: #172033;
+}
+
+.sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    width: var(--sidebar-width);
+    padding: 1.5rem 1rem;
+    background: #ffffff;
+    border-right: 1px solid #e6eaf0;
+    overflow-y: auto;
+    z-index: 100;
+}
+
+.main-content {
+    margin-left: var(--sidebar-width);
+    padding: 2rem 2.4rem 5rem;
+}
+
+.page-header {
+    margin-bottom: 1.5rem;
+}
+
+.content-section {
+    padding: 1rem 0 1.5rem;
+}
+
+.metric-label {
+    color: #6c7483;
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.metric-value {
+    font-size: 1.65rem;
+    font-weight: 750;
+    margin-top: 0.25rem;
+}
+
+.traceback {
+    max-height: 330px;
+    overflow: auto;
+    white-space: pre-wrap;
+    font-size: 0.75rem;
+}
+
+.font-monospace {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.card-header {
+    background: #fff;
+}
+
+@media (max-width: 991px) {
+    .sidebar {
+        position: static;
+        width: 100%;
+        border-right: none;
+        border-bottom: 1px solid #e6eaf0;
+    }
+
+    .main-content {
+        margin-left: 0;
+        padding: 1.25rem;
+    }
+}
