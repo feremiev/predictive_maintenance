@@ -1,25 +1,29 @@
-
 from __future__ import annotations
 
-import importlib
-import json
+import inspect
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Sequence
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from pathlib import Path
-import sys
 
+
+# =====================================================================
+# Project paths
+# =====================================================================
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
-
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# =====================================================================
+# Models exposed in the Dash interface
+# =====================================================================
 
 AVAILABLE_TABULAR_MODELS = [
     "linear",
@@ -28,6 +32,7 @@ AVAILABLE_TABULAR_MODELS = [
     "random_forest",
     "extra_trees",
     "hist_gradient_boosting",
+    "xgboost",
     "svr",
 ]
 
@@ -39,25 +44,26 @@ AVAILABLE_SEQUENCE_MODELS = [
 ]
 
 
+# =====================================================================
+# Project-class imports
+# =====================================================================
+
 def load_project_classes() -> tuple[dict[str, Any], str | None]:
     """
-    Import the project classes.
+    Import the project classes from the current project structure.
 
-    Expected project layout
-    -----------------------
-    cmapss_dataset.py
-        CMAPSSDataset
-
-    time_series_regression_model.py
-        TimeSeriesRegressionModel
-
-    sequence_rul_model.py
-        SequenceRULModel
-
-    experiment_manager.py
-        ExperimentManager
-
-    You can change these imports here if your module names are different.
+    Expected structure
+    ------------------
+    project_root/
+        models/
+            base_model.py
+            timeseries_model.py
+        utils/
+            data.py
+            modelManager.py
+        cmapss_dash_lab/
+            app.py
+            services.py
     """
     try:
         from utils.data import CMAPSSDataset
@@ -75,17 +81,28 @@ def load_project_classes() -> tuple[dict[str, Any], str | None]:
     except Exception as exc:
         return {}, (
             f"{type(exc).__name__}: {exc}\n\n"
-            "Place your four class modules beside app.py, or update "
-            "load_project_classes() in services.py."
+            "Check that models and utils are importable Python packages and "
+            "that the class names match the imports in services.py."
         )
 
 
+# =====================================================================
+# Service layer
+# =====================================================================
+
 class ExperimentService:
     """
-    Adapter between the Dash interface and the project model classes.
+    Connect the Dash application with the dataset loader, model classes, and
+    ExperimentManager.
 
-    Keeping orchestration outside callbacks makes the interface easier to test
-    and prevents UI code from becoming tightly coupled to model internals.
+    Workflow
+    --------
+    1. Load only train_FD00X files.
+    2. Split complete training motors into train and validation groups.
+    3. Train and save the experiment.
+    4. Optionally load the saved experiment and evaluate it against:
+           test_FD00X.txt + RUL_FD00X.txt
+    5. Add the official external-test results to the same experiment folder.
     """
 
     def __init__(
@@ -94,7 +111,13 @@ class ExperimentService:
         experiments_folder: str | Path = "experiments",
     ) -> None:
         self.classes = project_classes
-        self.experiments_folder = Path(experiments_folder)
+
+        experiments_path = Path(experiments_folder)
+
+        if not experiments_path.is_absolute():
+            experiments_path = PROJECT_ROOT / experiments_path
+
+        self.experiments_folder = experiments_path
 
         self.manager = (
             self.classes["ExperimentManager"](
@@ -104,49 +127,317 @@ class ExperimentService:
             else None
         )
 
-    # -----------------------------------------------------------------
-    # Data loading
-    # -----------------------------------------------------------------
+    # =================================================================
+    # Generic helpers
+    # =================================================================
 
     @staticmethod
-    def resolve_datasets(datasets: list[str]) -> tuple[str, ...]:
+    def resolve_datasets(
+        datasets: Sequence[str],
+    ) -> tuple[str, ...]:
+        """
+        Validate and normalize selected C-MAPSS dataset identifiers.
+        """
         if not datasets:
-            raise ValueError("Select at least one FD dataset.")
-        return tuple(datasets)
+            raise ValueError(
+                "Select at least one FD dataset."
+            )
+
+        allowed = {
+            "FD001",
+            "FD002",
+            "FD003",
+            "FD004",
+        }
+
+        resolved: list[str] = []
+
+        for dataset in datasets:
+            normalized = str(dataset).upper().strip()
+
+            if normalized not in allowed:
+                raise ValueError(
+                    f"Invalid dataset '{dataset}'."
+                )
+
+            if normalized not in resolved:
+                resolved.append(normalized)
+
+        return tuple(resolved)
+
+    @staticmethod
+    def _construct_with_supported_kwargs(
+        cls: type,
+        kwargs: dict[str, Any],
+    ) -> Any:
+        """
+        Construct a class while passing only parameters accepted by its current
+        constructor. This keeps the dashboard tolerant of small class-version
+        differences.
+        """
+        signature = inspect.signature(cls.__init__)
+
+        accepts_arbitrary_kwargs = any(
+            parameter.kind
+            == inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+
+        if accepts_arbitrary_kwargs:
+            return cls(**kwargs)
+
+        supported = {
+            name
+            for name in signature.parameters
+            if name != "self"
+        }
+
+        filtered_kwargs = {
+            key: value
+            for key, value in kwargs.items()
+            if key in supported
+        }
+
+        return cls(**filtered_kwargs)
+
+    @staticmethod
+    def _safe_prediction_table(
+        experiment: Any,
+        dataset: str,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Read a prediction table from a trained wrapper without failing when a
+        split is unavailable.
+        """
+        if not hasattr(
+            experiment,
+            "get_prediction_results",
+        ):
+            return None
+
+        try:
+            result = experiment.get_prediction_results(
+                dataset=dataset
+            )
+        except (
+            AttributeError,
+            FileNotFoundError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            return None
+
+        if not isinstance(result, pd.DataFrame):
+            return None
+
+        return result.copy()
+
+    @staticmethod
+    def _history_dataframe(
+        experiment: Any,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Convert a Keras History object or stored history dictionary into a
+        DataFrame.
+        """
+        history = getattr(
+            experiment,
+            "history",
+            None,
+        )
+
+        if history is None:
+            return None
+
+        history_data = getattr(
+            history,
+            "history",
+            history,
+        )
+
+        if isinstance(history_data, dict):
+            return pd.DataFrame(history_data)
+
+        if isinstance(history_data, pd.DataFrame):
+            return history_data.copy()
+
+        return None
+
+    @staticmethod
+    def _json_safe(
+        value: Any,
+    ) -> Any:
+        if value is None:
+            return None
+
+        if isinstance(
+            value,
+            (str, int, float, bool),
+        ):
+            return value
+
+        if isinstance(value, Path):
+            return str(value)
+
+        if isinstance(value, np.generic):
+            return value.item()
+
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+
+        if isinstance(value, pd.Series):
+            return value.tolist()
+
+        if isinstance(value, pd.Index):
+            return value.tolist()
+
+        if isinstance(value, dict):
+            return {
+                str(key): ExperimentService._json_safe(
+                    item
+                )
+                for key, item in value.items()
+            }
+
+        if isinstance(
+            value,
+            (list, tuple, set),
+        ):
+            return [
+                ExperimentService._json_safe(item)
+                for item in value
+            ]
+
+        return str(value)
+
+    @staticmethod
+    def _clean_dataframe(
+        frame: Optional[pd.DataFrame],
+    ) -> pd.DataFrame:
+        if frame is None:
+            return pd.DataFrame()
+
+        cleaned = frame.copy()
+
+        for column in cleaned.columns:
+            cleaned[column] = cleaned[column].map(
+                lambda value: (
+                    None
+                    if isinstance(value, float)
+                    and np.isnan(value)
+                    else value
+                )
+            )
+
+        return cleaned
+
+    @staticmethod
+    def _resolve_data_folder(
+        data_folder: str | Path,
+    ) -> Path:
+        """
+        Resolve relative data paths from the project root rather than from the
+        dashboard process working directory.
+        """
+        folder = Path(data_folder)
+
+        if not folder.is_absolute():
+            folder = PROJECT_ROOT / folder
+
+        return folder.resolve()
+
+    # =================================================================
+    # Data loading
+    # =================================================================
 
     def load_training_data(
         self,
-        data_folder: str,
-        datasets: list[str],
+        data_folder: str | Path,
+        datasets: Sequence[str],
         remove_nulls: bool,
         clip_rul: bool,
         rul_cap: int,
     ) -> pd.DataFrame:
-        loader = self.classes["CMAPSSDataset"](
-            data_folder=data_folder,
-            remove_nulls=remove_nulls,
-            create_rul=True,
-            clip_rul=clip_rul,
-            rul_clip_value=rul_cap,
+        """
+        Load and combine selected C-MAPSS training files.
+
+        The RUL target is calculated from the complete motor histories in the
+        train files. Official test and RUL files are not read here.
+        """
+        if not self.classes:
+            raise RuntimeError(
+                "Project classes are not available."
+            )
+
+        resolved_folder = self._resolve_data_folder(
+            data_folder
+        )
+
+        loader_class = self.classes[
+            "CMAPSSDataset"
+        ]
+
+        loader_kwargs = {
+            "data_folder": resolved_folder,
+            "remove_nulls": remove_nulls,
+            "create_rul": True,
+            "clip_rul": clip_rul,
+            "rul_clip_value": int(rul_cap),
+        }
+
+        loader = self._construct_with_supported_kwargs(
+            loader_class,
+            loader_kwargs,
         )
 
         frame = loader.load(
             file_type="train",
-            datasets=self.resolve_datasets(datasets),
+            datasets=self.resolve_datasets(
+                datasets
+            ),
             concatenate=True,
         )
 
         if not isinstance(frame, pd.DataFrame):
-            raise TypeError("CMAPSSDataset.load() must return a DataFrame.")
+            raise TypeError(
+                "CMAPSSDataset.load() must return a pandas DataFrame."
+            )
+
+        if frame.empty:
+            raise ValueError(
+                "The selected training files produced an empty DataFrame."
+            )
 
         return frame
 
-    # -----------------------------------------------------------------
-    # Experiment execution
-    # -----------------------------------------------------------------
+    # =================================================================
+    # Development experiment execution
+    # =================================================================
 
-    def run_and_save(self, config: dict[str, Any]) -> dict[str, Any]:
-        frame = self.load_training_data(
+    def run_and_save(
+        self,
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Train one tabular or sequence experiment using train and validation
+        motors, then save all development artifacts.
+
+        Returns
+        -------
+        dict
+            experiment_name
+            metrics
+            train_predictions
+            validation_predictions
+            history
+        """
+        if self.manager is None:
+            raise RuntimeError(
+                "ExperimentManager is unavailable."
+            )
+
+        training_data = self.load_training_data(
             data_folder=config["data_folder"],
             datasets=config["datasets"],
             remove_nulls=config["remove_nulls"],
@@ -154,40 +445,88 @@ class ExperimentService:
             rul_cap=config["rul_cap"],
         )
 
-        if config["model_family"] == "tabular":
-            experiment = self._create_tabular_model(frame, config)
-        elif config["model_family"] == "sequence":
-            experiment = self._create_sequence_model(frame, config)
+        model_family = config["model_family"]
+
+        if model_family == "tabular":
+            experiment = self._create_tabular_model(
+                training_data,
+                config,
+            )
+
+        elif model_family == "sequence":
+            experiment = self._create_sequence_model(
+                training_data,
+                config,
+            )
+
         else:
             raise ValueError(
-                f"Unsupported model family: {config['model_family']}"
+                f"Unsupported model family: {model_family}"
             )
 
         metrics = experiment.train()
 
+        train_predictions = self._safe_prediction_table(
+            experiment,
+            "train",
+        )
+
+        validation_predictions = self._safe_prediction_table(
+            experiment,
+            "validation",
+        )
+
+        history = self._history_dataframe(
+            experiment
+        )
+
+        resolved_data_folder = self._resolve_data_folder(
+            config["data_folder"]
+        )
+
         experiment_folder = self.manager.save_experiment(
             experiment=experiment,
-            experiment_name=config["experiment_name"],
+            experiment_name=config.get(
+                "experiment_name"
+            ),
             notes=(
-                f"Created from Dash. Datasets={config['datasets']}; "
-                f"clip_rul={config['clip_rul']}; rul_cap={config['rul_cap']}."
+                "Created from the Dash interface. "
+                f"Training datasets={config['datasets']}; "
+                f"clip_rul={config['clip_rul']}; "
+                f"rul_cap={config['rul_cap']}. "
+                "Official external testing is stored separately."
             ),
             extra_config={
-                "data_folder": config["data_folder"],
-                "datasets": config["datasets"],
-                "remove_nulls": config["remove_nulls"],
-                "clip_rul": config["clip_rul"],
-                "rul_cap": config["rul_cap"],
+                "model_family": model_family,
+                "data_folder": str(
+                    resolved_data_folder
+                ),
+                "datasets": list(
+                    self.resolve_datasets(
+                        config["datasets"]
+                    )
+                ),
+                "remove_nulls": bool(
+                    config["remove_nulls"]
+                ),
+                "clip_rul": bool(
+                    config["clip_rul"]
+                ),
+                "rul_cap": int(
+                    config["rul_cap"]
+                ),
             },
         )
 
-        predictions = self._best_prediction_table(experiment)
-        history = self._history_dataframe(experiment)
-
         return {
             "experiment_name": experiment_folder.name,
-            "metrics": self._json_safe(metrics),
-            "predictions": predictions,
+            "metrics": self._json_safe(
+                metrics
+            ),
+            "train_predictions": train_predictions,
+            "validation_predictions": (
+                validation_predictions
+            ),
             "history": history,
         }
 
@@ -196,19 +535,48 @@ class ExperimentService:
         frame: pd.DataFrame,
         config: dict[str, Any],
     ) -> Any:
-        cls = self.classes["TimeSeriesRegressionModel"]
+        """
+        Build the tabular TimeSeriesRegressionModel using an internal
+        train/validation motor split.
+        """
+        cls = self.classes[
+            "TimeSeriesRegressionModel"
+        ]
 
-        return cls(
-            df=frame,
-            target_column=config["target_column"],
-            group_column=config["group_column"],
-            time_column=config["time_column"],
-            model_name=config["model_name"],
-            test_group_count=config["test_group_count"],
-            group_selection=config["group_selection"],
-            columns_to_drop=config["columns_to_drop"],
-            random_state=config["random_state"],
-            model_params=config["model_params"],
+        kwargs = {
+            "df": frame,
+            "target_column": config[
+                "target_column"
+            ],
+            "group_column": config[
+                "group_column"
+            ],
+            "time_column": config[
+                "time_column"
+            ],
+            "model_name": config[
+                "model_name"
+            ],
+            "validation_group_count": config[
+                "validation_group_count"
+            ],
+            "group_selection": config[
+                "group_selection"
+            ],
+            "columns_to_drop": config[
+                "columns_to_drop"
+            ],
+            "random_state": config[
+                "random_state"
+            ],
+            "model_params": config[
+                "model_params"
+            ],
+        }
+
+        return self._construct_with_supported_kwargs(
+            cls,
+            kwargs,
         )
 
     def _create_sequence_model(
@@ -216,118 +584,720 @@ class ExperimentService:
         frame: pd.DataFrame,
         config: dict[str, Any],
     ) -> Any:
-        cls = self.classes["SequenceRULModel"]
+        """
+        Build the sequence model using train and validation motors only.
+        """
+        cls = self.classes[
+            "SequenceRULModel"
+        ]
 
-        # model_params can override architecture defaults accepted by
-        # SequenceRULModel, such as recurrent_units, dense_units, cnn_filters,
-        # dropout, kernel_size, or pool_size.
-        extra = dict(config["model_params"])
-
-        return cls(
-            df=frame,
-            target_column=config["target_column"],
-            group_column=config["group_column"],
-            time_column=config["time_column"],
-            feature_columns=config["feature_columns"],
-            columns_to_drop=config["columns_to_drop"],
-            model_type=config["model_name"],
-            window_type=config["window_type"],
-            window_size=config["window_size"],
-            min_window_size=config["min_window_size"],
-            max_window_size=config["max_window_size"],
-            stride=config["stride"],
-            prediction_horizon=config["prediction_horizon"],
-            test_group_count=config["test_group_count"],
-            validation_group_count=config["validation_group_count"],
-            group_selection=config["group_selection"],
-            random_state=config["random_state"],
-            scaler=config["scaler"],
-            learning_rate=config["learning_rate"],
-            loss=config["loss"],
-            batch_size=config["batch_size"],
-            epochs=config["epochs"],
-            patience=config["patience"],
-            **extra,
+        architecture_parameters = dict(
+            config.get(
+                "model_params",
+                {},
+            )
         )
 
-    # -----------------------------------------------------------------
-    # Saving and loading
-    # -----------------------------------------------------------------
+        kwargs = {
+            "df": frame,
+            "target_column": config[
+                "target_column"
+            ],
+            "group_column": config[
+                "group_column"
+            ],
+            "time_column": config[
+                "time_column"
+            ],
+            "feature_columns": config.get(
+                "feature_columns"
+            ),
+            "columns_to_drop": config.get(
+                "columns_to_drop",
+                [],
+            ),
+            "model_type": config[
+                "model_name"
+            ],
+            "window_type": config[
+                "window_type"
+            ],
+            "window_size": config[
+                "window_size"
+            ],
+            "min_window_size": config[
+                "min_window_size"
+            ],
+            "max_window_size": config[
+                "max_window_size"
+            ],
+            "stride": config[
+                "stride"
+            ],
+            "prediction_horizon": config[
+                "prediction_horizon"
+            ],
+            "validation_group_count": config[
+                "validation_group_count"
+            ],
+            "group_selection": config[
+                "group_selection"
+            ],
+            "random_state": config[
+                "random_state"
+            ],
+            "scaler": config[
+                "scaler"
+            ],
+            "learning_rate": config[
+                "learning_rate"
+            ],
+            "loss": config[
+                "loss"
+            ],
+            "batch_size": config[
+                "batch_size"
+            ],
+            "epochs": config[
+                "epochs"
+            ],
+            "patience": config[
+                "patience"
+            ],
+            **architecture_parameters,
+        }
 
-    def list_experiments(self) -> pd.DataFrame:
+        return self._construct_with_supported_kwargs(
+            cls,
+            kwargs,
+        )
+
+    # =================================================================
+    # Official external test
+    # =================================================================
+
+    def run_external_test(
+        self,
+        experiment_name: str,
+        data_folder: str | Path,
+        datasets: Sequence[str],
+        clip_rul: bool,
+        rul_cap: int,
+    ) -> dict[str, Any]:
+        """
+        Load a saved model, reconstruct its wrapper configuration, evaluate it
+        against official test + RUL files, and save those external results into
+        the same experiment folder.
+
+        Tabular models use:
+            evaluate_cmapss_final_cycles()
+
+        Sequence models use:
+            evaluate_cmapss_final_windows()
+        """
+        if self.manager is None:
+            raise RuntimeError(
+                "ExperimentManager is unavailable."
+            )
+
+        loaded = self.manager.load_experiment(
+            experiment_name
+        )
+
+        saved_config = dict(
+            loaded.config or {}
+        )
+
+        model_family = (
+            loaded.metadata.get(
+                "model_family"
+            )
+            or saved_config.get(
+                "model_family"
+            )
+        )
+
+        training_data_folder = saved_config.get(
+            "data_folder",
+            data_folder,
+        )
+
+        training_datasets = saved_config.get(
+            "datasets",
+            datasets,
+        )
+
+        training_data = self.load_training_data(
+            data_folder=training_data_folder,
+            datasets=training_datasets,
+            remove_nulls=bool(
+                saved_config.get(
+                    "remove_nulls",
+                    True,
+                )
+            ),
+            clip_rul=bool(
+                saved_config.get(
+                    "clip_rul",
+                    False,
+                )
+            ),
+            rul_cap=int(
+                saved_config.get(
+                    "rul_cap",
+                    125,
+                )
+            ),
+        )
+
+        external_folder = self._resolve_data_folder(
+            data_folder
+        )
+
+        if model_family == "sklearn":
+            model_family = "tabular"
+
+        if model_family == "tensorflow":
+            model_family = "sequence"
+
+        if model_family == "tabular":
+            wrapper = self._rebuild_tabular_wrapper(
+                training_data=training_data,
+                saved_config=saved_config,
+                loaded=loaded,
+            )
+
+            if not hasattr(
+                wrapper,
+                "evaluate_cmapss_final_cycles",
+            ):
+                raise AttributeError(
+                    "TimeSeriesRegressionModel does not provide "
+                    "evaluate_cmapss_final_cycles()."
+                )
+
+            results, metrics = (
+                wrapper.evaluate_cmapss_final_cycles(
+                    data_folder=external_folder,
+                    datasets=list(
+                        self.resolve_datasets(
+                            datasets
+                        )
+                    ),
+                    clip_rul=clip_rul,
+                    rul_clip_value=int(
+                        rul_cap
+                    ),
+                )
+            )
+
+        elif model_family == "sequence":
+            wrapper = self._rebuild_sequence_wrapper(
+                training_data=training_data,
+                saved_config=saved_config,
+                loaded=loaded,
+            )
+
+            if not hasattr(
+                wrapper,
+                "evaluate_cmapss_final_windows",
+            ):
+                raise AttributeError(
+                    "SequenceRULModel does not provide "
+                    "evaluate_cmapss_final_windows()."
+                )
+
+            results, metrics = (
+                wrapper.evaluate_cmapss_final_windows(
+                    data_folder=external_folder,
+                    datasets=list(
+                        self.resolve_datasets(
+                            datasets
+                        )
+                    ),
+                    clip_rul=clip_rul,
+                    rul_clip_value=int(
+                        rul_cap
+                    ),
+                )
+            )
+
+        else:
+            raise ValueError(
+                f"Unsupported saved model family: {model_family}"
+            )
+
+        self.manager.update_external_test(
+            experiment_name_or_path=experiment_name,
+            results=results,
+            metrics=metrics,
+        )
+
+        return {
+            "experiment_name": experiment_name,
+            "metrics": self._json_safe(
+                metrics
+            ),
+            "predictions": results,
+        }
+
+    def _rebuild_tabular_wrapper(
+        self,
+        training_data: pd.DataFrame,
+        saved_config: dict[str, Any],
+        loaded: Any,
+    ) -> Any:
+        """
+        Recreate the tabular wrapper around the loaded fitted pipeline.
+
+        Reconstructing the wrapper restores feature-selection and C-MAPSS
+        external-evaluation behavior without retraining the estimator.
+        """
+        cls = self.classes[
+            "TimeSeriesRegressionModel"
+        ]
+
+        kwargs = {
+            "df": training_data,
+            "target_column": saved_config.get(
+                "target_column",
+                "RUL",
+            ),
+            "group_column": saved_config.get(
+                "group_column",
+                "unique_motor_id",
+            ),
+            "time_column": saved_config.get(
+                "time_column",
+                "cycle",
+            ),
+            "feature_columns": saved_config.get(
+                "feature_columns"
+            ),
+            "columns_to_drop": saved_config.get(
+                "columns_to_drop",
+                [],
+            ),
+            "model_name": saved_config.get(
+                "model_name",
+                saved_config.get(
+                    "model_type",
+                    "random_forest",
+                ),
+            ),
+            "model_params": saved_config.get(
+                "model_params",
+                {},
+            ),
+            "validation_group_count": saved_config.get(
+                "validation_group_count"
+            ),
+            "validation_group_size": saved_config.get(
+                "validation_group_size",
+                0.2,
+            ),
+            "group_selection": saved_config.get(
+                "group_selection",
+                "random",
+            ),
+            "random_state": saved_config.get(
+                "random_state",
+                42,
+            ),
+        }
+
+        wrapper = self._construct_with_supported_kwargs(
+            cls,
+            kwargs,
+        )
+
+        wrapper.pipeline = loaded.model
+
+        if hasattr(
+            loaded.model,
+            "named_steps",
+        ):
+            named_steps = loaded.model.named_steps
+
+            if "model" in named_steps:
+                wrapper.model = named_steps[
+                    "model"
+                ]
+
+            elif named_steps:
+                wrapper.model = list(
+                    named_steps.values()
+                )[-1]
+
+        else:
+            wrapper.model = loaded.model
+
+        if loaded.scaler is not None:
+            wrapper.scaler = loaded.scaler
+
+        # The external evaluator may use the saved training feature names.
+        if loaded.feature_names:
+            feature_names = list(
+                loaded.feature_names
+            )
+
+            available_features = [
+                column
+                for column in feature_names
+                if column in training_data.columns
+            ]
+
+            if available_features:
+                wrapper.X_train = training_data[
+                    available_features
+                ].copy()
+
+        # If the class needs its normal split attributes, create only the
+        # train/validation split. This does not fit the loaded pipeline.
+        if (
+            getattr(
+                wrapper,
+                "X_train",
+                None,
+            )
+            is None
+        ):
+            for method_name in (
+                "split_data",
+                "split_groups",
+            ):
+                method = getattr(
+                    wrapper,
+                    method_name,
+                    None,
+                )
+
+                if callable(method):
+                    method()
+                    break
+
+        return wrapper
+
+    def _rebuild_sequence_wrapper(
+        self,
+        training_data: pd.DataFrame,
+        saved_config: dict[str, Any],
+        loaded: Any,
+    ) -> Any:
+        """
+        Recreate the sequence wrapper around the loaded Keras model and scaler.
+        """
+        cls = self.classes[
+            "SequenceRULModel"
+        ]
+
+        kwargs = {
+            "df": training_data,
+            "target_column": saved_config.get(
+                "target_column",
+                "RUL",
+            ),
+            "group_column": saved_config.get(
+                "group_column",
+                "unique_motor_id",
+            ),
+            "time_column": saved_config.get(
+                "time_column",
+                "cycle",
+            ),
+            "feature_columns": saved_config.get(
+                "feature_columns"
+            ),
+            "columns_to_drop": saved_config.get(
+                "columns_to_drop",
+                [],
+            ),
+            "model_type": saved_config.get(
+                "model_type",
+                "lstm",
+            ),
+            "window_type": saved_config.get(
+                "window_type",
+                "sliding",
+            ),
+            "window_size": saved_config.get(
+                "window_size",
+                30,
+            ),
+            "min_window_size": saved_config.get(
+                "min_window_size",
+                10,
+            ),
+            "max_window_size": saved_config.get(
+                "max_window_size",
+                saved_config.get(
+                    "window_size",
+                    30,
+                ),
+            ),
+            "stride": saved_config.get(
+                "stride",
+                1,
+            ),
+            "prediction_horizon": saved_config.get(
+                "prediction_horizon",
+                0,
+            ),
+            "padding_value": saved_config.get(
+                "padding_value",
+                0.0,
+            ),
+            "validation_group_count": saved_config.get(
+                "validation_group_count"
+            ),
+            "validation_group_size": saved_config.get(
+                "validation_group_size",
+                0.15,
+            ),
+            "group_selection": saved_config.get(
+                "group_selection",
+                "random",
+            ),
+            "random_state": saved_config.get(
+                "random_state",
+                42,
+            ),
+            "scaler": saved_config.get(
+                "scaler_name",
+                "standard",
+            ),
+            "recurrent_units": saved_config.get(
+                "recurrent_units",
+                [128, 64],
+            ),
+            "dense_units": saved_config.get(
+                "dense_units",
+                [64, 32],
+            ),
+            "cnn_filters": saved_config.get(
+                "cnn_filters",
+                [64, 128],
+            ),
+            "kernel_size": saved_config.get(
+                "kernel_size",
+                3,
+            ),
+            "pool_size": saved_config.get(
+                "pool_size",
+                2,
+            ),
+            "dropout": saved_config.get(
+                "dropout",
+                0.2,
+            ),
+            "recurrent_dropout": saved_config.get(
+                "recurrent_dropout",
+                0.0,
+            ),
+            "bidirectional": saved_config.get(
+                "bidirectional",
+                False,
+            ),
+            "learning_rate": saved_config.get(
+                "learning_rate",
+                0.001,
+            ),
+            "loss": saved_config.get(
+                "loss",
+                "huber",
+            ),
+            "batch_size": saved_config.get(
+                "batch_size",
+                64,
+            ),
+            "epochs": saved_config.get(
+                "epochs",
+                100,
+            ),
+            "patience": saved_config.get(
+                "patience",
+                12,
+            ),
+            "reduce_lr": saved_config.get(
+                "reduce_lr",
+                True,
+            ),
+            "reduce_lr_patience": saved_config.get(
+                "reduce_lr_patience",
+                5,
+            ),
+            "reduce_lr_factor": saved_config.get(
+                "reduce_lr_factor",
+                0.5,
+            ),
+            "min_learning_rate": saved_config.get(
+                "min_learning_rate",
+                1e-6,
+            ),
+            "shuffle_windows": saved_config.get(
+                "shuffle_windows",
+                True,
+            ),
+            "verbose": 0,
+        }
+
+        wrapper = self._construct_with_supported_kwargs(
+            cls,
+            kwargs,
+        )
+
+        wrapper.model = loaded.model
+        wrapper.scaler = loaded.scaler
+
+        return wrapper
+
+    # =================================================================
+    # Saved-experiment access
+    # =================================================================
+
+    def list_experiments(
+        self,
+    ) -> pd.DataFrame:
+        """
+        Return saved experiments with train, validation, and external-test
+        metrics kept in separate columns.
+        """
+        if self.manager is None:
+            return pd.DataFrame()
+
         frame = self.manager.list_experiments()
-        return self._clean_dataframe(frame)
+
+        return self._clean_dataframe(
+            frame
+        )
 
     def compare_experiments(
         self,
-        experiment_names: list[str],
+        experiment_names: Sequence[str],
     ) -> pd.DataFrame:
+        """
+        Compare selected experiments using validation RMSE by default.
+
+        External-test columns remain visible when those results exist.
+        """
+        if self.manager is None:
+            return pd.DataFrame()
+
         frame = self.manager.compare_experiments(
-            experiments=experiment_names,
-            sort_by="test_RMSE",
+            experiments=list(
+                experiment_names
+            ),
+            sort_by="validation_RMSE",
         )
-        return self._clean_dataframe(frame)
 
-    def load_saved(self, experiment_name: str) -> dict[str, Any]:
-        loaded = self.manager.load_experiment(experiment_name)
+        return self._clean_dataframe(
+            frame
+        )
 
-        predictions = None
-        for split in ("test", "validation", "train"):
-            try:
-                predictions = loaded.get_predictions(split)
-                if predictions is not None and not predictions.empty:
-                    break
-            except Exception:
-                continue
+    def load_saved(
+        self,
+        experiment_name: str,
+    ) -> dict[str, Any]:
+        """
+        Load all available artifacts required by the updated dashboard.
+        """
+        if self.manager is None:
+            raise RuntimeError(
+                "ExperimentManager is unavailable."
+            )
+
+        loaded = self.manager.load_experiment(
+            experiment_name
+        )
+
+        train_predictions = self._load_saved_split(
+            loaded,
+            "train",
+        )
+
+        validation_predictions = self._load_saved_split(
+            loaded,
+            "validation",
+        )
+
+        external_test_predictions = (
+            self._load_saved_split(
+                loaded,
+                "external_test",
+            )
+        )
 
         return {
             "metrics": loaded.metrics,
-            "predictions": predictions,
+            "train_predictions": train_predictions,
+            "validation_predictions": (
+                validation_predictions
+            ),
+            "external_test_predictions": (
+                external_test_predictions
+            ),
             "history": loaded.history,
             "loaded": loaded,
         }
 
-    # -----------------------------------------------------------------
-    # Result extraction
-    # -----------------------------------------------------------------
-
     @staticmethod
-    def _best_prediction_table(experiment: Any) -> pd.DataFrame | None:
-        for split in ("test", "validation", "train"):
-            try:
-                result = experiment.get_prediction_results(dataset=split)
-                if isinstance(result, pd.DataFrame) and not result.empty:
-                    return result
-            except Exception:
-                continue
-        return None
-
-    @staticmethod
-    def _history_dataframe(experiment: Any) -> pd.DataFrame | None:
-        history = getattr(experiment, "history", None)
-        if history is None:
+    def _load_saved_split(
+        loaded: Any,
+        split_name: str,
+    ) -> Optional[pd.DataFrame]:
+        try:
+            predictions = loaded.get_predictions(
+                split_name
+            )
+        except (
+            AttributeError,
+            FileNotFoundError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
             return None
 
-        history_dict = getattr(history, "history", history)
-        if isinstance(history_dict, dict):
-            return pd.DataFrame(history_dict)
+        if not isinstance(
+            predictions,
+            pd.DataFrame,
+        ):
+            return None
 
-        if isinstance(history_dict, pd.DataFrame):
-            return history_dict.copy()
+        return predictions.copy()
 
-        return None
+    # =================================================================
+    # Metric formatting utilities
+    # =================================================================
 
     @staticmethod
     def select_primary_metrics(
         metrics: dict[str, Any],
     ) -> dict[str, Any]:
-        for key in ("test", "external_test", "validation", "train"):
-            value = metrics.get(key)
-            if isinstance(value, dict):
-                return value
+        """
+        Select validation metrics for development displays, then external test,
+        then train metrics as fallbacks.
+        """
+        for split_name in (
+            "validation",
+            "external_test",
+            "train",
+        ):
+            values = metrics.get(
+                split_name
+            )
 
-        # Some train methods may return a flat metrics dictionary.
-        if any(key in metrics for key in ("MAE", "RMSE", "R2")):
+            if isinstance(values, dict):
+                return values
+
+        if any(
+            key in metrics
+            for key in (
+                "MAE",
+                "RMSE",
+                "R2",
+            )
+        ):
             return metrics
 
         return {}
@@ -337,163 +1307,278 @@ class ExperimentService:
         cls,
         metrics: dict[str, Any],
     ) -> pd.DataFrame:
+        """
+        Convert train, validation, and official external-test metrics into a
+        dashboard-friendly table.
+        """
         rows = []
 
-        for split, values in metrics.items():
+        display_names = {
+            "train": "Train",
+            "validation": "Validation",
+            "external_test": "Official test",
+        }
+
+        for split_name in (
+            "train",
+            "validation",
+            "external_test",
+        ):
+            values = metrics.get(
+                split_name
+            )
+
             if not isinstance(values, dict):
                 continue
 
-            row = {"split": split}
-            for key, value in values.items():
-                if isinstance(value, (int, float, np.number)):
-                    row[key] = float(value)
-            if len(row) > 1:
-                rows.append(row)
+            row: dict[str, Any] = {
+                "split": display_names[
+                    split_name
+                ]
+            }
 
-        if not rows and metrics:
-            row = {"split": "test"}
-            row.update(
-                {
-                    key: float(value)
-                    for key, value in metrics.items()
-                    if isinstance(value, (int, float, np.number))
-                }
-            )
+            for key, value in values.items():
+                if isinstance(
+                    value,
+                    (int, float, np.number),
+                ):
+                    row[key] = float(value)
+
+                elif key in {
+                    "evaluation_method",
+                    "datasets",
+                }:
+                    row[key] = value
+
             rows.append(row)
 
         return pd.DataFrame(rows)
 
-    # -----------------------------------------------------------------
-    # Plotly figures
-    # -----------------------------------------------------------------
+    @staticmethod
+    def format_metric(
+        value: Any,
+    ) -> str:
+        if value is None:
+            return "—"
+
+        try:
+            return f"{float(value):.4f}"
+        except (
+            TypeError,
+            ValueError,
+        ):
+            return str(value)
+
+    # =================================================================
+    # Optional Plotly helpers retained for compatibility
+    # =================================================================
 
     @staticmethod
     def prediction_figure(
-        predictions: pd.DataFrame | None,
+        predictions: Optional[pd.DataFrame],
+        title: str = "Actual vs predicted",
     ) -> go.Figure:
         if predictions is None or predictions.empty:
             return go.Figure().update_layout(
-                title="Actual vs predicted",
-                annotations=[{"text": "No predictions available", "showarrow": False}],
+                title=title
             )
 
-        actual_col = "actual" if "actual" in predictions else None
-        predicted_col = (
-            "predicted"
-            if "predicted" in predictions
-            else "predicted_RUL"
-            if "predicted_RUL" in predictions
+        actual_column = (
+            "actual"
+            if "actual" in predictions.columns
             else None
         )
 
-        if not actual_col or not predicted_col:
-            return go.Figure().update_layout(title="Actual vs predicted")
+        predicted_column = (
+            "predicted"
+            if "predicted" in predictions.columns
+            else "predicted_RUL"
+            if "predicted_RUL"
+            in predictions.columns
+            else None
+        )
 
-        frame = predictions[[actual_col, predicted_col]].dropna()
-        fig = px.scatter(
+        if (
+            actual_column is None
+            or predicted_column is None
+        ):
+            return go.Figure().update_layout(
+                title=title
+            )
+
+        frame = predictions[
+            [
+                actual_column,
+                predicted_column,
+            ]
+        ].dropna()
+
+        figure = px.scatter(
             frame,
-            x=actual_col,
-            y=predicted_col,
+            x=actual_column,
+            y=predicted_column,
             opacity=0.5,
-            title="Actual vs predicted",
+            title=title,
         )
 
         if not frame.empty:
-            lower = float(min(frame.min()))
-            upper = float(max(frame.max()))
-            fig.add_trace(
+            lower = float(
+                min(
+                    frame[actual_column].min(),
+                    frame[
+                        predicted_column
+                    ].min(),
+                )
+            )
+            upper = float(
+                max(
+                    frame[actual_column].max(),
+                    frame[
+                        predicted_column
+                    ].max(),
+                )
+            )
+
+            figure.add_trace(
                 go.Scatter(
                     x=[lower, upper],
                     y=[lower, upper],
                     mode="lines",
                     name="Ideal",
-                    line={"dash": "dash"},
+                    line={
+                        "dash": "dash"
+                    },
                 )
             )
-        return fig
+
+        return figure
 
     @staticmethod
     def residual_figure(
-        predictions: pd.DataFrame | None,
+        predictions: Optional[pd.DataFrame],
+        title: str = "Residuals",
     ) -> go.Figure:
         if predictions is None or predictions.empty:
-            return go.Figure().update_layout(title="Residuals")
+            return go.Figure().update_layout(
+                title=title
+            )
 
-        predicted_col = (
+        frame = predictions.copy()
+
+        predicted_column = (
             "predicted"
-            if "predicted" in predictions
+            if "predicted" in frame.columns
             else "predicted_RUL"
-            if "predicted_RUL" in predictions
+            if "predicted_RUL"
+            in frame.columns
             else None
         )
 
-        frame = predictions.copy()
-        if "residual" not in frame and "actual" in frame and predicted_col:
-            frame["residual"] = frame["actual"] - frame[predicted_col]
+        if predicted_column is None:
+            return go.Figure().update_layout(
+                title=title
+            )
 
-        if not predicted_col or "residual" not in frame:
-            return go.Figure().update_layout(title="Residuals")
+        if (
+            "residual" not in frame.columns
+            and "actual" in frame.columns
+        ):
+            frame["residual"] = (
+                frame["actual"]
+                - frame[predicted_column]
+            )
 
-        fig = px.scatter(
+        if "residual" not in frame.columns:
+            return go.Figure().update_layout(
+                title=title
+            )
+
+        figure = px.scatter(
             frame,
-            x=predicted_col,
+            x=predicted_column,
             y="residual",
             opacity=0.5,
-            title="Residuals vs prediction",
+            title=title,
         )
-        fig.add_hline(y=0, line_dash="dash")
-        return fig
+
+        figure.add_hline(
+            y=0,
+            line_dash="dash",
+        )
+
+        return figure
 
     @staticmethod
     def error_distribution_figure(
-        predictions: pd.DataFrame | None,
+        predictions: Optional[pd.DataFrame],
+        title: str = "Error distribution",
     ) -> go.Figure:
         if predictions is None or predictions.empty:
-            return go.Figure().update_layout(title="Error distribution")
+            return go.Figure().update_layout(
+                title=title
+            )
 
         frame = predictions.copy()
-        predicted_col = (
+
+        predicted_column = (
             "predicted"
-            if "predicted" in frame
+            if "predicted" in frame.columns
             else "predicted_RUL"
-            if "predicted_RUL" in frame
+            if "predicted_RUL"
+            in frame.columns
             else None
         )
 
-        if "residual" not in frame and "actual" in frame and predicted_col:
-            frame["residual"] = frame["actual"] - frame[predicted_col]
+        if (
+            "residual" not in frame.columns
+            and predicted_column is not None
+            and "actual" in frame.columns
+        ):
+            frame["residual"] = (
+                frame["actual"]
+                - frame[predicted_column]
+            )
 
-        if "residual" not in frame:
-            return go.Figure().update_layout(title="Error distribution")
+        if "residual" not in frame.columns:
+            return go.Figure().update_layout(
+                title=title
+            )
 
         return px.histogram(
             frame,
             x="residual",
             nbins=50,
-            title="Residual distribution",
+            title=title,
         )
 
     @staticmethod
     def history_figure(
-        history: pd.DataFrame | None,
+        history: Optional[pd.DataFrame],
     ) -> go.Figure:
         if history is None or history.empty:
             return go.Figure().update_layout(
-                title="Training history",
-                annotations=[
-                    {
-                        "text": "Available for sequence models",
-                        "showarrow": False,
-                    }
-                ],
+                title=(
+                    "Training history — "
+                    "available for sequence models"
+                )
             )
 
-        frame = history.reset_index(names="epoch")
-        fig = go.Figure()
+        frame = history.reset_index(
+            names="epoch"
+        )
 
-        for column in ("loss", "val_loss", "mae", "val_mae"):
-            if column in frame:
-                fig.add_trace(
+        figure = go.Figure()
+
+        for column in (
+            "loss",
+            "val_loss",
+            "mae",
+            "val_mae",
+            "rmse",
+            "val_rmse",
+        ):
+            if column in frame.columns:
+                figure.add_trace(
                     go.Scatter(
                         x=frame["epoch"],
                         y=frame[column],
@@ -502,83 +1587,60 @@ class ExperimentService:
                     )
                 )
 
-        fig.update_layout(
-            title="Training history",
+        figure.update_layout(
+            title=(
+                "Training and validation history"
+            ),
             xaxis_title="Epoch",
-            yaxis_title="Metric",
+            yaxis_title="Metric value",
         )
-        return fig
+
+        return figure
 
     @staticmethod
     def comparison_figure(
         comparison: pd.DataFrame,
     ) -> go.Figure:
         if comparison is None or comparison.empty:
-            return go.Figure().update_layout(title="Experiment comparison")
+            return go.Figure().update_layout(
+                title="Experiment comparison"
+            )
 
         metric = next(
             (
                 column
-                for column in ("test_RMSE", "test_MAE", "test_R2")
-                if column in comparison.columns
+                for column in (
+                    "validation_RMSE",
+                    "validation_MAE",
+                    "external_test_RMSE",
+                    "external_test_MAE",
+                )
+                if column
+                in comparison.columns
             ),
             None,
         )
 
         if metric is None:
-            return go.Figure().update_layout(title="Experiment comparison")
+            return go.Figure().update_layout(
+                title="Experiment comparison"
+            )
 
-        frame = comparison.dropna(subset=[metric]).copy()
+        frame = comparison.dropna(
+            subset=[metric]
+        ).copy()
+
         return px.bar(
             frame,
             x="experiment_name",
             y=metric,
-            color="model_type" if "model_type" in frame else None,
-            title=f"Saved experiments by {metric}",
+            color=(
+                "model_type"
+                if "model_type"
+                in frame.columns
+                else None
+            ),
+            title=(
+                f"Saved experiments by {metric}"
+            ),
         )
-
-    # -----------------------------------------------------------------
-    # Helpers
-    # -----------------------------------------------------------------
-
-    @staticmethod
-    def format_metric(value: Any) -> str:
-        if value is None:
-            return "—"
-        try:
-            return f"{float(value):.4f}"
-        except (TypeError, ValueError):
-            return str(value)
-
-    @staticmethod
-    def _clean_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
-        if frame is None:
-            return pd.DataFrame()
-
-        cleaned = frame.copy()
-        for column in cleaned.columns:
-            cleaned[column] = cleaned[column].map(
-                lambda value: (
-                    None
-                    if isinstance(value, float) and np.isnan(value)
-                    else value
-                )
-            )
-        return cleaned
-
-    @staticmethod
-    def _json_safe(value: Any) -> Any:
-        if value is None or isinstance(value, (str, int, float, bool)):
-            return value
-        if isinstance(value, np.generic):
-            return value.item()
-        if isinstance(value, np.ndarray):
-            return value.tolist()
-        if isinstance(value, dict):
-            return {
-                str(key): ExperimentService._json_safe(item)
-                for key, item in value.items()
-            }
-        if isinstance(value, (list, tuple)):
-            return [ExperimentService._json_safe(item) for item in value]
-        return str(value)

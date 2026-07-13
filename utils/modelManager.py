@@ -34,7 +34,7 @@ class ExperimentManager:
             history.csv
             train_predictions.csv
             validation_predictions.csv
-            test_predictions.csv
+            external_test_predictions.csv
             feature_names.json
             group_ids.json
             notes.txt
@@ -49,7 +49,7 @@ class ExperimentManager:
         - scaler
         - configuration
         - metrics
-        - predictions
+        - train, validation, and official external-test predictions
         - history
         - feature names
         - group IDs
@@ -264,17 +264,8 @@ class ExperimentManager:
         experiment_name_or_path: str | Path,
     ) -> "LoadedExperiment":
         """
-        Load a saved experiment.
-
-        Parameters
-        ----------
-        experiment_name_or_path:
-            Experiment folder name or complete folder path.
-
-        Returns
-        -------
-        LoadedExperiment
-            Object containing the saved model and experiment artifacts.
+        Load a saved experiment and all available development and official-test
+        artifacts.
         """
         experiment_folder = self._resolve_experiment_path(
             experiment_name_or_path
@@ -283,18 +274,14 @@ class ExperimentManager:
         metadata = self._read_json(
             experiment_folder / "metadata.json"
         )
-
         config = self._read_json(
             experiment_folder / "config.json"
         )
-
         metrics = self._read_json(
             experiment_folder / "metrics.json"
         )
 
-        model_family = metadata[
-            "model_family"
-        ]
+        model_family = metadata["model_family"]
 
         model = self._load_model(
             experiment_folder=experiment_folder,
@@ -304,49 +291,41 @@ class ExperimentManager:
         scaler = self._load_optional_joblib(
             experiment_folder / "scaler.joblib"
         )
-
         history = self._load_optional_csv(
             experiment_folder / "history.csv"
         )
-
         train_predictions = self._load_optional_csv(
-            experiment_folder
-            / "train_predictions.csv"
+            experiment_folder / "train_predictions.csv"
         )
-
         validation_predictions = self._load_optional_csv(
-            experiment_folder
-            / "validation_predictions.csv"
+            experiment_folder / "validation_predictions.csv"
+        )
+        external_test_predictions = self._load_optional_csv(
+            experiment_folder / "external_test_predictions.csv"
         )
 
-        test_predictions = self._load_optional_csv(
-            experiment_folder
-            / "test_predictions.csv"
-        )
+        # Backward compatibility for experiments saved by older versions.
+        if external_test_predictions is None:
+            legacy_test_path = (
+                experiment_folder / "test_predictions.csv"
+            )
+            external_test_predictions = self._load_optional_csv(
+                legacy_test_path
+            )
 
         feature_importance = self._load_optional_csv(
-            experiment_folder
-            / "feature_importance.csv"
+            experiment_folder / "feature_importance.csv"
         )
-
         feature_names = self._read_optional_json(
-            experiment_folder
-            / "feature_names.json"
+            experiment_folder / "feature_names.json"
         )
-
         group_ids = self._read_optional_json(
-            experiment_folder
-            / "group_ids.json"
+            experiment_folder / "group_ids.json"
         )
 
-        notes_path = (
-            experiment_folder / "notes.txt"
-        )
-
+        notes_path = experiment_folder / "notes.txt"
         notes = (
-            notes_path.read_text(
-                encoding="utf-8"
-            )
+            notes_path.read_text(encoding="utf-8")
             if notes_path.exists()
             else None
         )
@@ -365,13 +344,64 @@ class ExperimentManager:
             history=history,
             train_predictions=train_predictions,
             validation_predictions=validation_predictions,
-            test_predictions=test_predictions,
+            external_test_predictions=external_test_predictions,
             feature_names=feature_names,
             group_ids=group_ids,
             feature_importance=feature_importance,
             notes=notes,
             extra_tables=extra_tables,
         )
+
+    def update_external_test(
+        self,
+        experiment_name_or_path: str | Path,
+        results: pd.DataFrame,
+        metrics: dict[str, Any],
+    ) -> Path:
+        """
+        Add or replace the official external-test results of an existing
+        experiment without retraining or rewriting the saved model.
+
+        The supplied results normally come from:
+
+            evaluate_cmapss_final_cycles(...)
+            evaluate_cmapss_final_windows(...)
+        """
+        if not isinstance(results, pd.DataFrame):
+            raise TypeError(
+                "results must be a pandas DataFrame."
+            )
+
+        experiment_folder = self._resolve_experiment_path(
+            experiment_name_or_path
+        )
+
+        metrics_path = experiment_folder / "metrics.json"
+        stored_metrics = (
+            self._read_json(metrics_path)
+            if metrics_path.exists()
+            else {}
+        )
+
+        stored_metrics["external_test"] = self._make_json_safe(
+            metrics
+        )
+
+        self._write_json(
+            metrics_path,
+            stored_metrics,
+        )
+
+        results.to_csv(
+            experiment_folder / "external_test_predictions.csv",
+            index=False,
+        )
+
+        print(
+            f"✅ External test added to: {experiment_folder}"
+        )
+
+        return experiment_folder
 
     # ==========================================================
     # Experiment discovery
@@ -381,66 +411,59 @@ class ExperimentManager:
         self,
     ) -> pd.DataFrame:
         """
-        Return a table containing all saved experiments.
+        Return all saved experiments with development-validation and official
+        external-test metrics shown separately.
         """
         rows = []
 
-        for folder in sorted(
-            self.base_folder.iterdir()
-        ):
+        for folder in sorted(self.base_folder.iterdir()):
             if not folder.is_dir():
                 continue
 
-            metadata_path = (
-                folder / "metadata.json"
-            )
-
-            metrics_path = (
-                folder / "metrics.json"
-            )
+            metadata_path = folder / "metadata.json"
+            metrics_path = folder / "metrics.json"
 
             if not metadata_path.exists():
                 continue
 
-            metadata = self._read_json(
-                metadata_path
-            )
-
+            metadata = self._read_json(metadata_path)
             metrics = (
                 self._read_json(metrics_path)
                 if metrics_path.exists()
                 else {}
             )
 
-            test_metrics = self._find_test_metrics(
+            train_metrics = metrics.get("train", {})
+            validation_metrics = metrics.get(
+                "validation",
+                {},
+            )
+            external_metrics = self._find_external_test_metrics(
                 metrics
             )
 
-            rows.append({
-                "experiment_name": folder.name,
-                "created_at": metadata.get(
-                    "created_at"
-                ),
-                "model_family": metadata.get(
-                    "model_family"
-                ),
-                "model_type": metadata.get(
-                    "model_type"
-                ),
-                "window_type": metadata.get(
-                    "window_type"
-                ),
-                "test_MAE": test_metrics.get(
-                    "MAE"
-                ),
-                "test_RMSE": test_metrics.get(
-                    "RMSE"
-                ),
-                "test_R2": test_metrics.get(
-                    "R2"
-                ),
-                "folder": str(folder),
-            })
+            rows.append(
+                {
+                    "experiment_name": folder.name,
+                    "created_at": metadata.get("created_at"),
+                    "model_family": metadata.get("model_family"),
+                    "model_type": metadata.get("model_type"),
+                    "window_type": metadata.get("window_type"),
+                    "train_MAE": train_metrics.get("MAE"),
+                    "validation_MAE": validation_metrics.get("MAE"),
+                    "external_test_MAE": external_metrics.get("MAE"),
+                    "train_RMSE": train_metrics.get("RMSE"),
+                    "validation_RMSE": validation_metrics.get("RMSE"),
+                    "external_test_RMSE": external_metrics.get("RMSE"),
+                    "train_R2": train_metrics.get("R2"),
+                    "validation_R2": validation_metrics.get("R2"),
+                    "external_test_R2": external_metrics.get("R2"),
+                    "external_test_method": external_metrics.get(
+                        "evaluation_method"
+                    ),
+                    "folder": str(folder),
+                }
+            )
 
         return pd.DataFrame(rows)
 
@@ -449,22 +472,15 @@ class ExperimentManager:
         experiments: Optional[
             Sequence[str | Path]
         ] = None,
-        sort_by: str = "test_RMSE",
+        sort_by: str = "validation_RMSE",
         ascending: bool = True,
     ) -> pd.DataFrame:
         """
-        Compare metrics from multiple experiments.
+        Compare experiments.
 
-        Parameters
-        ----------
-        experiments:
-            Experiment names or folders. If None, all experiments are used.
-
-        sort_by:
-            Column used for sorting.
-
-        ascending:
-            Sorting direction.
+        During model development, sort by validation metrics. Official
+        external-test metrics are displayed when available but should not be
+        used repeatedly for model selection.
         """
         if experiments is None:
             comparison = self.list_experiments()
@@ -477,81 +493,60 @@ class ExperimentManager:
                     experiment_ref
                 )
 
-                test_metrics = self._find_test_metrics(
-                    loaded.metrics
+                train_metrics = loaded.metrics.get(
+                    "train",
+                    {},
                 )
-
-                validation_metrics = (
-                    loaded.metrics.get(
-                        "validation",
-                        {},
+                validation_metrics = loaded.metrics.get(
+                    "validation",
+                    {},
+                )
+                external_metrics = (
+                    self._find_external_test_metrics(
+                        loaded.metrics
                     )
                 )
 
-                train_metrics = (
-                    loaded.metrics.get(
-                        "train",
-                        {},
-                    )
-                )
-
-                rows.append({
-                    "experiment_name": (
-                        loaded.folder.name
-                    ),
-                    "model_family": (
-                        loaded.metadata.get(
+                rows.append(
+                    {
+                        "experiment_name": loaded.folder.name,
+                        "model_family": loaded.metadata.get(
                             "model_family"
-                        )
-                    ),
-                    "model_type": (
-                        loaded.metadata.get(
+                        ),
+                        "model_type": loaded.metadata.get(
                             "model_type"
-                        )
-                    ),
-                    "window_type": (
-                        loaded.metadata.get(
+                        ),
+                        "window_type": loaded.metadata.get(
                             "window_type"
-                        )
-                    ),
-                    "train_MAE": train_metrics.get(
-                        "MAE"
-                    ),
-                    "validation_MAE": (
-                        validation_metrics.get(
+                        ),
+                        "train_MAE": train_metrics.get("MAE"),
+                        "validation_MAE": validation_metrics.get(
                             "MAE"
-                        )
-                    ),
-                    "test_MAE": test_metrics.get(
-                        "MAE"
-                    ),
-                    "train_RMSE": train_metrics.get(
-                        "RMSE"
-                    ),
-                    "validation_RMSE": (
-                        validation_metrics.get(
+                        ),
+                        "external_test_MAE": external_metrics.get(
+                            "MAE"
+                        ),
+                        "train_RMSE": train_metrics.get("RMSE"),
+                        "validation_RMSE": validation_metrics.get(
                             "RMSE"
-                        )
-                    ),
-                    "test_RMSE": test_metrics.get(
-                        "RMSE"
-                    ),
-                    "train_R2": train_metrics.get(
-                        "R2"
-                    ),
-                    "validation_R2": (
-                        validation_metrics.get(
+                        ),
+                        "external_test_RMSE": external_metrics.get(
+                            "RMSE"
+                        ),
+                        "train_R2": train_metrics.get("R2"),
+                        "validation_R2": validation_metrics.get(
                             "R2"
-                        )
-                    ),
-                    "test_R2": test_metrics.get(
-                        "R2"
-                    ),
-                })
+                        ),
+                        "external_test_R2": external_metrics.get(
+                            "R2"
+                        ),
+                        "external_test_method": external_metrics.get(
+                            "evaluation_method"
+                        ),
+                    }
+                )
 
-            comparison = pd.DataFrame(
-                rows
-            )
+            comparison = pd.DataFrame(rows)
 
         if (
             not comparison.empty
@@ -563,9 +558,7 @@ class ExperimentManager:
                 na_position="last",
             )
 
-        return comparison.reset_index(
-            drop=True
-        )
+        return comparison.reset_index(drop=True)
 
     def delete_experiment(
         self,
@@ -746,9 +739,7 @@ class ExperimentManager:
             "stride",
             "prediction_horizon",
             "padding_value",
-            "test_group_count",
             "validation_group_count",
-            "test_group_size",
             "validation_group_size",
             "group_selection",
             "random_state",
@@ -770,6 +761,7 @@ class ExperimentManager:
             "reduce_lr_patience",
             "reduce_lr_factor",
             "min_learning_rate",
+            "shuffle_windows",
         ]
 
         config = {}
@@ -795,9 +787,9 @@ class ExperimentManager:
         experiment: Any,
     ) -> dict[str, Any]:
         """
-        Extract train, validation, test, and cross-validation metrics.
+        Extract development metrics and optional official external-test metrics.
         """
-        metrics = {}
+        metrics: dict[str, Any] = {}
 
         if getattr(
             experiment,
@@ -813,19 +805,17 @@ class ExperimentManager:
             "validation_metrics",
             None,
         ) is not None:
-            metrics["validation"] = (
-                self._make_json_safe(
-                    experiment.validation_metrics
-                )
+            metrics["validation"] = self._make_json_safe(
+                experiment.validation_metrics
             )
 
         if getattr(
             experiment,
-            "test_metrics",
+            "external_test_metrics",
             None,
         ) is not None:
-            metrics["test"] = self._make_json_safe(
-                experiment.test_metrics
+            metrics["external_test"] = self._make_json_safe(
+                experiment.external_test_metrics
             )
 
         if getattr(
@@ -833,12 +823,11 @@ class ExperimentManager:
             "cv_summary",
             None,
         ) is not None:
-            metrics["cross_validation"] = (
-                self._make_json_safe(
-                    experiment.cv_summary
-                )
+            metrics["cross_validation"] = self._make_json_safe(
+                experiment.cv_summary
             )
 
+        # Backward-compatible fallback for generic wrappers.
         if (
             not metrics
             and getattr(
@@ -847,7 +836,7 @@ class ExperimentManager:
                 None,
             ) is not None
         ):
-            metrics["test"] = self._make_json_safe(
+            metrics["validation"] = self._make_json_safe(
                 experiment.metrics
             )
 
@@ -992,48 +981,67 @@ class ExperimentManager:
         experiment_folder: Path,
     ) -> None:
         """
-        Save prediction tables when get_prediction_results is available.
+        Save train and validation predictions, plus the official external-test
+        predictions when that evaluation has already been executed.
         """
-        if not hasattr(
+        if hasattr(
             experiment,
             "get_prediction_results",
         ):
-            return
-
-        datasets = [
-            "train",
-            "validation",
-            "test",
-        ]
-
-        for dataset in datasets:
-            try:
-                results = (
-                    experiment.get_prediction_results(
+            for dataset in ["train", "validation"]:
+                try:
+                    results = experiment.get_prediction_results(
                         dataset=dataset
                     )
-                )
+                except (
+                    ValueError,
+                    RuntimeError,
+                    TypeError,
+                    AttributeError,
+                ):
+                    continue
 
+                if (
+                    isinstance(results, pd.DataFrame)
+                    and not results.empty
+                ):
+                    results.to_csv(
+                        experiment_folder
+                        / f"{dataset}_predictions.csv",
+                        index=False,
+                    )
+
+        external_results = getattr(
+            experiment,
+            "external_test_results",
+            None,
+        )
+
+        if external_results is None and hasattr(
+            experiment,
+            "get_external_test_results",
+        ):
+            try:
+                external_results = (
+                    experiment.get_external_test_results()
+                )
             except (
                 ValueError,
                 RuntimeError,
                 TypeError,
                 AttributeError,
             ):
-                continue
+                external_results = None
 
-            if (
-                isinstance(
-                    results,
-                    pd.DataFrame,
-                )
-                and not results.empty
-            ):
-                results.to_csv(
-                    experiment_folder
-                    / f"{dataset}_predictions.csv",
-                    index=False,
-                )
+        if (
+            isinstance(external_results, pd.DataFrame)
+            and not external_results.empty
+        ):
+            external_results.to_csv(
+                experiment_folder
+                / "external_test_predictions.csv",
+                index=False,
+            )
 
     def _save_feature_names(
         self,
@@ -1083,7 +1091,6 @@ class ExperimentManager:
         for split_name in [
             "train",
             "validation",
-            "test",
         ]:
             attribute_name = (
                 f"{split_name}_group_ids"
@@ -1325,16 +1332,20 @@ class ExperimentManager:
         return tables
 
     @staticmethod
-    def _find_test_metrics(
+    def _find_external_test_metrics(
         metrics: dict[str, Any],
     ) -> dict[str, Any]:
+        """
+        Return official external-test metrics.
+
+        The legacy 'test' key is accepted only for experiments saved before the
+        train/validation/external-test naming update.
+        """
+        if "external_test" in metrics:
+            return metrics["external_test"]
+
         if "test" in metrics:
             return metrics["test"]
-
-        if "external_test" in metrics:
-            return metrics[
-                "external_test"
-            ]
 
         return {}
 
@@ -1456,7 +1467,7 @@ class LoadedExperiment:
         validation_predictions: Optional[
             pd.DataFrame
         ] = None,
-        test_predictions: Optional[
+        external_test_predictions: Optional[
             pd.DataFrame
         ] = None,
         feature_names: Optional[list[str]] = None,
@@ -1480,7 +1491,7 @@ class LoadedExperiment:
         self.validation_predictions = (
             validation_predictions
         )
-        self.test_predictions = test_predictions
+        self.external_test_predictions = external_test_predictions
         self.feature_names = feature_names
         self.group_ids = group_ids
         self.feature_importance = (
@@ -1527,38 +1538,34 @@ class LoadedExperiment:
 
     def get_predictions(
         self,
-        dataset: str = "test",
+        dataset: str = "validation",
     ) -> pd.DataFrame:
         """
-        Return saved train, validation, or test predictions.
+        Return saved train, validation, or official external-test predictions.
         """
         dataset = dataset.lower()
 
         if dataset == "train":
-            predictions = (
-                self.train_predictions
-            )
+            predictions = self.train_predictions
 
         elif dataset == "validation":
-            predictions = (
-                self.validation_predictions
-            )
+            predictions = self.validation_predictions
 
-        elif dataset == "test":
-            predictions = (
-                self.test_predictions
-            )
+        elif dataset in {
+            "external_test",
+            "test",
+        }:
+            predictions = self.external_test_predictions
 
         else:
             raise ValueError(
-                "dataset must be 'train', "
-                "'validation', or 'test'."
+                "dataset must be 'train', 'validation', or "
+                "'external_test'."
             )
 
         if predictions is None:
             raise FileNotFoundError(
-                f"No saved {dataset} predictions "
-                "were found."
+                f"No saved {dataset} predictions were found."
             )
 
         return predictions.copy()
@@ -1708,7 +1715,7 @@ class LoadedExperiment:
 
     def plot_predictions(
         self,
-        dataset: str = "test",
+        dataset: str = "validation",
         actual_column: str = "actual",
         prediction_column: str = "predicted",
     ) -> None:
@@ -1770,7 +1777,7 @@ class LoadedExperiment:
 
     def plot_residuals(
         self,
-        dataset: str = "test",
+        dataset: str = "validation",
         actual_column: str = "actual",
         prediction_column: str = "predicted",
     ) -> None:
@@ -1828,7 +1835,7 @@ class LoadedExperiment:
 
     def plot_error_distribution(
         self,
-        dataset: str = "test",
+        dataset: str = "validation",
         actual_column: str = "actual",
         prediction_column: str = "predicted",
         bins: int = 30,

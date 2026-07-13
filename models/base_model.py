@@ -23,6 +23,7 @@ from sklearn.model_selection import GroupKFold, cross_validate
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVR
+from xgboost import XGBRegressor
 
 from pathlib import Path
 from typing import Callable, Sequence, Union
@@ -35,9 +36,9 @@ class TimeSeriesRegressionModel:
     -------
     Each ``unique_motor_id`` represents one complete engine time series.
 
-    The train/test split is performed using complete groups. Therefore,
+    The train/validation split is performed using complete groups. Therefore,
     observations from the same motor cannot appear in both training and
-    testing datasets.
+    validation datasets.
 
     This class treats every row as one tabular observation. It is appropriate
     for models such as Random Forest, Extra Trees, Gradient Boosting, Ridge,
@@ -55,6 +56,7 @@ class TimeSeriesRegressionModel:
         "extra_trees",
         "hist_gradient_boosting",
         "svr",
+        "xgboost"
     }
 
     CMAPSS_COLUMN_NAMES = (
@@ -76,8 +78,8 @@ class TimeSeriesRegressionModel:
         time_column: Optional[str] = None,
         model_name: str = "random_forest",
         model: Optional[RegressorMixin] = None,
-        test_group_count: Optional[int] = None,
-        test_group_size: float = 0.2,
+        validation_group_count: Optional[int] = None,
+        validation_group_size: float = 0.2,
         group_selection: str = "random",
         columns_to_drop: Optional[list[str]] = None,
         random_state: int = 42,
@@ -115,17 +117,17 @@ class TimeSeriesRegressionModel:
             Optional custom scikit-learn compatible regression model.
             When provided, ``model_name`` is ignored.
 
-        test_group_count:
-            Exact number of complete series to use for testing.
+        validation_group_count:
+            Exact number of complete series to use for validation.
 
             Example: ``10`` reserves ten complete motors.
 
-        test_group_size:
-            Fraction of complete series used for testing when
-            ``test_group_count`` is not provided.
+        validation_group_size:
+            Fraction of complete series used for validation when
+            ``validation_group_count`` is not provided.
 
         group_selection:
-            Strategy used to choose test groups:
+            Strategy used to choose validation groups:
 
             - ``random``: randomly select complete groups.
             - ``last``: use the last groups after sorting.
@@ -146,8 +148,8 @@ class TimeSeriesRegressionModel:
         self.time_column = time_column
         self.model_name = model_name.lower()
         self.custom_model = model
-        self.test_group_count = test_group_count
-        self.test_group_size = test_group_size
+        self.validation_group_count = validation_group_count
+        self.validation_group_size = validation_group_size
         self.group_selection = group_selection.lower()
         self.columns_to_drop = columns_to_drop or []
         self.random_state = random_state
@@ -156,34 +158,34 @@ class TimeSeriesRegressionModel:
         # Fitted pipeline
         self.pipeline: Optional[Pipeline] = None
 
-        # Train/test datasets
+        # Train/validation datasets
         self.X_train: Optional[pd.DataFrame] = None
-        self.X_test: Optional[pd.DataFrame] = None
+        self.X_validation: Optional[pd.DataFrame] = None
         self.y_train: Optional[pd.Series] = None
-        self.y_test: Optional[pd.Series] = None
+        self.y_validation: Optional[pd.Series] = None
 
         # Group information
         self.groups_train: Optional[pd.Series] = None
-        self.groups_test: Optional[pd.Series] = None
+        self.groups_validation: Optional[pd.Series] = None
         self.train_group_ids: Optional[np.ndarray] = None
-        self.test_group_ids: Optional[np.ndarray] = None
+        self.validation_group_ids: Optional[np.ndarray] = None
 
         # Original DataFrame indexes
         self.train_index: Optional[pd.Index] = None
-        self.test_index: Optional[pd.Index] = None
+        self.validation_index: Optional[pd.Index] = None
 
         # Predictions
         self.y_train_pred: Optional[np.ndarray] = None
-        self.y_test_pred: Optional[np.ndarray] = None
+        self.y_validation_pred: Optional[np.ndarray] = None
 
-        # Backwards-compatible alias for test predictions
+        # Backwards-compatible alias for validation predictions
         self.y_pred: Optional[np.ndarray] = None
 
         # Metrics
         self.train_metrics: Optional[dict[str, float]] = None
-        self.test_metrics: Optional[dict[str, float]] = None
+        self.validation_metrics: Optional[dict[str, float]] = None
 
-        # Backwards-compatible alias for test metrics
+        # Backwards-compatible alias for validation metrics
         self.metrics: Optional[dict[str, float]] = None
 
         # Cross-validation
@@ -226,17 +228,17 @@ class TimeSeriesRegressionModel:
                 "group_selection must be 'random', 'first', or 'last'."
             )
 
-        if not 0 < self.test_group_size < 1:
+        if not 0 < self.validation_group_size < 1:
             raise ValueError(
-                "test_group_size must be greater than 0 and smaller than 1."
+                "validation_group_size must be greater than 0 and smaller than 1."
             )
 
         if (
-            self.test_group_count is not None
-            and self.test_group_count <= 0
+            self.validation_group_count is not None
+            and self.validation_group_count <= 0
         ):
             raise ValueError(
-                "test_group_count must be greater than zero."
+                "validation_group_count must be greater than zero."
             )
 
         if self.df[self.target_column].isna().any():
@@ -354,9 +356,31 @@ class TimeSeriesRegressionModel:
 
             return SVR(**default_params)
 
+        if self.model_name == "xgboost":
+            default_params = {
+                "objective": "reg:squarederror",
+                "n_estimators": 500,
+                "learning_rate": 0.05,
+                "max_depth": 6,
+                "min_child_weight": 3,
+                "subsample": 0.8,
+                "colsample_bytree": 0.8,
+                "reg_alpha": 0.0,
+                "reg_lambda": 1.0,
+                "random_state": self.random_state,
+                "n_jobs": -1,
+                "tree_method": "hist",
+                "eval_metric": "mae",
+            }
+
+            default_params.update(params)
+
+            return XGBRegressor(**default_params)
+
         raise ValueError(
             f"Could not create model '{self.model_name}'."
         )
+
 
     def _model_requires_scaling(self) -> bool:
         """
@@ -405,7 +429,7 @@ class TimeSeriesRegressionModel:
         )
 
     # ==========================================================
-    # Train/test split by complete series
+    # Train/validation split by complete series
     # ==========================================================
 
     def split_data(
@@ -419,7 +443,7 @@ class TimeSeriesRegressionModel:
         """
         Split the dataset using complete groups.
 
-        No group can appear in both train and test.
+        No group can appear in both train and validation.
         """
         data = self._prepare_dataframe()
         feature_columns = self._feature_columns()
@@ -442,39 +466,39 @@ class TimeSeriesRegressionModel:
                 "At least two unique groups are required."
             )
 
-        if self.test_group_count is not None:
-            number_of_test_groups = self.test_group_count
+        if self.validation_group_count is not None:
+            number_of_validation_groups = self.validation_group_count
         else:
-            number_of_test_groups = max(
+            number_of_validation_groups = max(
                 1,
-                int(np.ceil(group_count * self.test_group_size)),
+                int(np.ceil(group_count * self.validation_group_size)),
             )
 
-        if number_of_test_groups >= group_count:
+        if number_of_validation_groups >= group_count:
             raise ValueError(
-                "The number of test groups must be smaller than "
+                "The number of validation groups must be smaller than "
                 "the total number of groups."
             )
 
         if self.group_selection == "random":
             rng = np.random.default_rng(self.random_state)
 
-            self.test_group_ids = rng.choice(
+            self.validation_group_ids = rng.choice(
                 group_ids,
-                size=number_of_test_groups,
+                size=number_of_validation_groups,
                 replace=False,
             )
 
         elif self.group_selection == "last":
-            self.test_group_ids = group_ids[-number_of_test_groups:]
+            self.validation_group_ids = group_ids[-number_of_validation_groups:]
 
         else:
-            self.test_group_ids = group_ids[:number_of_test_groups]
+            self.validation_group_ids = group_ids[:number_of_validation_groups]
 
-        test_mask = data[self.group_column].isin(
-            self.test_group_ids
+        validation_mask = data[self.group_column].isin(
+            self.validation_group_ids
         )
-        train_mask = ~test_mask
+        train_mask = ~validation_mask
 
         self.train_group_ids = (
             data.loc[train_mask, self.group_column]
@@ -487,8 +511,8 @@ class TimeSeriesRegressionModel:
             feature_columns,
         ].copy()
 
-        self.X_test = data.loc[
-            test_mask,
+        self.X_validation = data.loc[
+            validation_mask,
             feature_columns,
         ].copy()
 
@@ -497,8 +521,8 @@ class TimeSeriesRegressionModel:
             self.target_column,
         ].copy()
 
-        self.y_test = data.loc[
-            test_mask,
+        self.y_validation = data.loc[
+            validation_mask,
             self.target_column,
         ].copy()
 
@@ -507,16 +531,16 @@ class TimeSeriesRegressionModel:
             self.group_column,
         ].copy()
 
-        self.groups_test = data.loc[
-            test_mask,
+        self.groups_validation = data.loc[
+            validation_mask,
             self.group_column,
         ].copy()
 
         self.train_index = self.X_train.index
-        self.test_index = self.X_test.index
+        self.validation_index = self.X_validation.index
 
         overlap = set(self.train_group_ids).intersection(
-            set(self.test_group_ids)
+            set(self.validation_group_ids)
         )
 
         if overlap:
@@ -526,19 +550,19 @@ class TimeSeriesRegressionModel:
 
         print(
             f"Training series: {len(self.train_group_ids)} | "
-            f"Testing series: {len(self.test_group_ids)}"
+            f"Validation series: {len(self.validation_group_ids)}"
         )
 
         print(
             f"Training rows: {len(self.X_train):,} | "
-            f"Testing rows: {len(self.X_test):,}"
+            f"Validation rows: {len(self.X_validation):,}"
         )
 
         return (
             self.X_train,
-            self.X_test,
+            self.X_validation,
             self.y_train,
-            self.y_test,
+            self.y_validation,
         )
 
     # ==========================================================
@@ -547,12 +571,12 @@ class TimeSeriesRegressionModel:
 
     def train(self) -> dict[str, dict[str, float]]:
         """
-        Fit the model and calculate both train and test metrics.
+        Fit the model and calculate both train and validation metrics.
 
         Returns
         -------
         dict
-            Dictionary containing train and test metrics.
+            Dictionary containing train and validation metrics.
         """
         if self.X_train is None:
             self.split_data()
@@ -568,29 +592,29 @@ class TimeSeriesRegressionModel:
             self.X_train
         )
 
-        self.y_test_pred = self.pipeline.predict(
-            self.X_test
+        self.y_validation_pred = self.pipeline.predict(
+            self.X_validation
         )
 
         # Backwards-compatible alias
-        self.y_pred = self.y_test_pred
+        self.y_pred = self.y_validation_pred
 
         self.train_metrics = self._calculate_metrics(
             self.y_train,
             self.y_train_pred,
         )
 
-        self.test_metrics = self._calculate_metrics(
-            self.y_test,
-            self.y_test_pred,
+        self.validation_metrics = self._calculate_metrics(
+            self.y_validation,
+            self.y_validation_pred,
         )
 
         # Backwards-compatible alias
-        self.metrics = self.test_metrics
+        self.metrics = self.validation_metrics
 
         return {
             "train": self.train_metrics.copy(),
-            "test": self.test_metrics.copy(),
+            "validation": self.validation_metrics.copy(),
         }
 
     def evaluate(
@@ -608,28 +632,28 @@ class TimeSeriesRegressionModel:
                 self.X_train
             )
 
-        if self.y_test_pred is None:
-            self.y_test_pred = self.pipeline.predict(
-                self.X_test
+        if self.y_validation_pred is None:
+            self.y_validation_pred = self.pipeline.predict(
+                self.X_validation
             )
 
-        self.y_pred = self.y_test_pred
+        self.y_pred = self.y_validation_pred
 
         self.train_metrics = self._calculate_metrics(
             self.y_train,
             self.y_train_pred,
         )
 
-        self.test_metrics = self._calculate_metrics(
-            self.y_test,
-            self.y_test_pred,
+        self.validation_metrics = self._calculate_metrics(
+            self.y_validation,
+            self.y_validation_pred,
         )
 
-        self.metrics = self.test_metrics
+        self.metrics = self.validation_metrics
 
         return {
             "train": self.train_metrics.copy(),
-            "test": self.test_metrics.copy(),
+            "validation": self.validation_metrics.copy(),
         }
 
     @staticmethod
@@ -688,26 +712,26 @@ class TimeSeriesRegressionModel:
 
     def get_overfitting_summary(self) -> dict[str, Any]:
         """
-        Compare training and testing metrics.
+        Compare training and validation metrics.
 
-        A large gap between training and testing performance may indicate
+        A large gap between training and validation performance may indicate
         overfitting.
         """
         self._ensure_trained()
 
         mae_gap = (
-            self.test_metrics["MAE"]
+            self.validation_metrics["MAE"]
             - self.train_metrics["MAE"]
         )
 
         rmse_gap = (
-            self.test_metrics["RMSE"]
+            self.validation_metrics["RMSE"]
             - self.train_metrics["RMSE"]
         )
 
         r2_gap = (
             self.train_metrics["R2"]
-            - self.test_metrics["R2"]
+            - self.validation_metrics["R2"]
         )
 
         train_mae = self.train_metrics["MAE"]
@@ -719,21 +743,21 @@ class TimeSeriesRegressionModel:
         )
 
         if relative_mae_increase < 0.20:
-            interpretation = "Low train/test error gap."
+            interpretation = "Low train/validation error gap."
         elif relative_mae_increase < 0.50:
             interpretation = (
-                "Moderate train/test error gap. "
+                "Moderate train/validation error gap. "
                 "Check for mild overfitting."
             )
         else:
             interpretation = (
-                "Large train/test error gap. "
+                "Large train/validation error gap. "
                 "The model may be overfitting."
             )
 
         return {
             "train_MAE": self.train_metrics["MAE"],
-            "test_MAE": self.test_metrics["MAE"],
+            "validation_MAE": self.validation_metrics["MAE"],
             "MAE_gap": float(mae_gap),
             "RMSE_gap": float(rmse_gap),
             "R2_gap": float(r2_gap),
@@ -794,27 +818,27 @@ class TimeSeriesRegressionModel:
         )
 
         train_mae = -self.cv_results["train_mae"]
-        test_mae = -self.cv_results["test_mae"]
+        validation_mae = -self.cv_results["validation_mae"]
 
         train_rmse = -self.cv_results["train_rmse"]
-        test_rmse = -self.cv_results["test_rmse"]
+        validation_rmse = -self.cv_results["validation_rmse"]
 
         train_r2 = self.cv_results["train_r2"]
-        test_r2 = self.cv_results["test_r2"]
+        validation_r2 = self.cv_results["validation_r2"]
 
         self.cv_summary = {
             "CV Train MAE mean": float(train_mae.mean()),
             "CV Train MAE std": float(train_mae.std()),
-            "CV Test MAE mean": float(test_mae.mean()),
-            "CV Test MAE std": float(test_mae.std()),
+            "CV Validation MAE mean": float(validation_mae.mean()),
+            "CV Validation MAE std": float(validation_mae.std()),
             "CV Train RMSE mean": float(train_rmse.mean()),
             "CV Train RMSE std": float(train_rmse.std()),
-            "CV Test RMSE mean": float(test_rmse.mean()),
-            "CV Test RMSE std": float(test_rmse.std()),
+            "CV Validation RMSE mean": float(validation_rmse.mean()),
+            "CV Validation RMSE std": float(validation_rmse.std()),
             "CV Train R2 mean": float(train_r2.mean()),
             "CV Train R2 std": float(train_r2.std()),
-            "CV Test R2 mean": float(test_r2.mean()),
-            "CV Test R2 std": float(test_r2.std()),
+            "CV Validation R2 mean": float(validation_r2.mean()),
+            "CV Validation R2 std": float(validation_r2.std()),
         }
 
         return self.cv_summary.copy()
@@ -835,14 +859,14 @@ class TimeSeriesRegressionModel:
             {
                 "fold": np.arange(
                     1,
-                    len(self.cv_results["test_mae"]) + 1,
+                    len(self.cv_results["validation_mae"]) + 1,
                 ),
                 "train_MAE": -self.cv_results["train_mae"],
-                "test_MAE": -self.cv_results["test_mae"],
+                "validation_MAE": -self.cv_results["validation_mae"],
                 "train_RMSE": -self.cv_results["train_rmse"],
-                "test_RMSE": -self.cv_results["test_rmse"],
+                "validation_RMSE": -self.cv_results["validation_rmse"],
                 "train_R2": self.cv_results["train_r2"],
-                "test_R2": self.cv_results["test_r2"],
+                "validation_R2": self.cv_results["validation_r2"],
             }
         )
 
@@ -910,7 +934,7 @@ class TimeSeriesRegressionModel:
         return {
             "model_name": self.model_name,
             "train_metrics": self.train_metrics.copy(),
-            "test_metrics": self.test_metrics.copy(),
+            "validation_metrics": self.validation_metrics.copy(),
             "overfitting_summary": self.get_overfitting_summary(),
             "cross_validation": (
                 None
@@ -919,10 +943,10 @@ class TimeSeriesRegressionModel:
             ),
             "model_parameters": self.get_model_parameters(),
             "training_rows": len(self.X_train),
-            "testing_rows": len(self.X_test),
+            "validation_rows": len(self.X_validation),
             "training_groups": len(self.train_group_ids),
-            "testing_groups": len(self.test_group_ids),
-            "test_group_ids": self.test_group_ids.copy(),
+            "validation_groups": len(self.validation_group_ids),
+            "validation_group_ids": self.validation_group_ids.copy(),
         }
 
     def get_model_parameters(self) -> dict[str, Any]:
@@ -936,7 +960,7 @@ class TimeSeriesRegressionModel:
 
     def get_prediction_results(
         self,
-        dataset: str = "test",
+        dataset: str = "validation",
     ) -> pd.DataFrame:
         """
         Return row-level predictions and residuals.
@@ -944,7 +968,7 @@ class TimeSeriesRegressionModel:
         Parameters
         ----------
         dataset:
-            ``train`` or ``test``.
+            ``train`` or ``validation``.
         """
         self._ensure_trained()
 
@@ -955,14 +979,14 @@ class TimeSeriesRegressionModel:
             y_true = np.asarray(self.y_train)
             y_pred = self.y_train_pred
 
-        elif dataset == "test":
-            index = self.test_index
-            y_true = np.asarray(self.y_test)
-            y_pred = self.y_test_pred
+        elif dataset == "validation":
+            index = self.validation_index
+            y_true = np.asarray(self.y_validation)
+            y_pred = self.y_validation_pred
 
         else:
             raise ValueError(
-                "dataset must be 'train' or 'test'."
+                "dataset must be 'train' or 'validation'."
             )
 
         results = self.df.loc[
@@ -987,20 +1011,20 @@ class TimeSeriesRegressionModel:
 
     def get_all_prediction_results(self) -> pd.DataFrame:
         """
-        Return train and test prediction results in one DataFrame.
+        Return train and validation prediction results in one DataFrame.
         """
         train_results = self.get_prediction_results(
             dataset="train"
         )
 
-        test_results = self.get_prediction_results(
-            dataset="test"
+        validation_results = self.get_prediction_results(
+            dataset="validation"
         )
 
         return pd.concat(
             [
                 train_results,
-                test_results,
+                validation_results,
             ],
             ignore_index=True,
         )
@@ -1056,7 +1080,7 @@ class TimeSeriesRegressionModel:
     def get_metrics_by_target_range(
         self,
         bins: Optional[list[float]] = None,
-        dataset: str = "test",
+        dataset: str = "validation",
     ) -> pd.DataFrame:
         """
         Calculate error metrics for different target/RUL ranges.
@@ -1110,7 +1134,7 @@ class TimeSeriesRegressionModel:
 
     def get_metrics_by_group(
         self,
-        dataset: str = "test",
+        dataset: str = "validation",
     ) -> pd.DataFrame:
         """
         Calculate metrics independently for each motor or series.
@@ -1158,7 +1182,7 @@ class TimeSeriesRegressionModel:
         if (
             self.pipeline is None
             or self.y_train_pred is None
-            or self.y_test_pred is None
+            or self.y_validation_pred is None
         ):
             raise RuntimeError(
                 "The model has not been trained. "
@@ -1171,10 +1195,10 @@ class TimeSeriesRegressionModel:
 
     def plot_predictions(
         self,
-        dataset: str = "test",
+        dataset: str = "validation",
     ) -> None:
         """
-        Plot actual versus predicted values for train or test.
+        Plot actual versus predicted values for train or validation.
         """
         results = self.get_prediction_results(
             dataset=dataset
@@ -1215,23 +1239,23 @@ class TimeSeriesRegressionModel:
         plt.tight_layout()
         plt.show()
 
-    def plot_train_vs_test_predictions(self) -> None:
+    def plot_train_vs_validation_predictions(self) -> None:
         """
-        Plot train and test actual-versus-predicted values together.
+        Plot train and validation actual-versus-predicted values together.
         """
         self._ensure_trained()
 
         all_actual = np.concatenate(
             [
                 np.asarray(self.y_train),
-                np.asarray(self.y_test),
+                np.asarray(self.y_validation),
             ]
         )
 
         all_predicted = np.concatenate(
             [
                 self.y_train_pred,
-                self.y_test_pred,
+                self.y_validation_pred,
             ]
         )
 
@@ -1255,10 +1279,10 @@ class TimeSeriesRegressionModel:
         )
 
         plt.scatter(
-            self.y_test,
-            self.y_test_pred,
+            self.y_validation,
+            self.y_validation_pred,
             alpha=0.55,
-            label="Test",
+            label="Validation",
         )
 
         plt.plot(
@@ -1271,7 +1295,7 @@ class TimeSeriesRegressionModel:
         plt.ylabel("Predicted values")
 
         plt.title(
-            f"Train vs Test Predictions — {self.model_name}"
+            f"Train vs Validation Predictions — {self.model_name}"
         )
 
         plt.legend()
@@ -1280,7 +1304,7 @@ class TimeSeriesRegressionModel:
 
     def plot_residuals(
         self,
-        dataset: str = "test",
+        dataset: str = "validation",
     ) -> None:
         """
         Plot residuals against predicted values.
@@ -1313,9 +1337,9 @@ class TimeSeriesRegressionModel:
         plt.tight_layout()
         plt.show()
 
-    def plot_train_vs_test_residuals(self) -> None:
+    def plot_train_vs_validation_residuals(self) -> None:
         """
-        Compare train and test residuals on the same chart.
+        Compare train and validation residuals on the same chart.
         """
         self._ensure_trained()
 
@@ -1324,9 +1348,9 @@ class TimeSeriesRegressionModel:
             - self.y_train_pred
         )
 
-        test_residuals = (
-            np.asarray(self.y_test)
-            - self.y_test_pred
+        validation_residuals = (
+            np.asarray(self.y_validation)
+            - self.y_validation_pred
         )
 
         plt.figure(figsize=(8, 6))
@@ -1339,10 +1363,10 @@ class TimeSeriesRegressionModel:
         )
 
         plt.scatter(
-            self.y_test_pred,
-            test_residuals,
+            self.y_validation_pred,
+            validation_residuals,
             alpha=0.55,
-            label="Test",
+            label="Validation",
         )
 
         plt.axhline(
@@ -1354,7 +1378,7 @@ class TimeSeriesRegressionModel:
         plt.ylabel("Residual: actual - predicted")
 
         plt.title(
-            f"Train vs Test Residuals — {self.model_name}"
+            f"Train vs Validation Residuals — {self.model_name}"
         )
 
         plt.legend()
@@ -1363,7 +1387,7 @@ class TimeSeriesRegressionModel:
 
     def plot_residuals_vs_target(
         self,
-        dataset: str = "test",
+        dataset: str = "validation",
     ) -> None:
         """
         Plot residuals against actual target values.
@@ -1403,9 +1427,9 @@ class TimeSeriesRegressionModel:
         plt.tight_layout()
         plt.show()
 
-    def plot_train_vs_test_residuals_by_target(self) -> None:
+    def plot_train_vs_validation_residuals_by_target(self) -> None:
         """
-        Compare train and test residuals against actual target values.
+        Compare train and validation residuals against actual target values.
         """
         self._ensure_trained()
 
@@ -1414,9 +1438,9 @@ class TimeSeriesRegressionModel:
             - self.y_train_pred
         )
 
-        test_residuals = (
-            np.asarray(self.y_test)
-            - self.y_test_pred
+        validation_residuals = (
+            np.asarray(self.y_validation)
+            - self.y_validation_pred
         )
 
         plt.figure(figsize=(8, 6))
@@ -1429,10 +1453,10 @@ class TimeSeriesRegressionModel:
         )
 
         plt.scatter(
-            self.y_test,
-            test_residuals,
+            self.y_validation,
+            validation_residuals,
             alpha=0.55,
-            label="Test",
+            label="Validation",
         )
 
         plt.axhline(
@@ -1459,7 +1483,7 @@ class TimeSeriesRegressionModel:
 
     def plot_residuals_vs_time(
         self,
-        dataset: str = "test",
+        dataset: str = "validation",
     ) -> None:
         """
         Plot residuals against the time/cycle column.
@@ -1501,11 +1525,11 @@ class TimeSeriesRegressionModel:
 
     def plot_error_distribution(
         self,
-        dataset: str = "test",
+        dataset: str = "validation",
         bins: int = 30,
     ) -> None:
         """
-        Plot the residual distribution for train or test.
+        Plot the residual distribution for train or validation.
         """
         results = self.get_prediction_results(
             dataset=dataset
@@ -1537,12 +1561,12 @@ class TimeSeriesRegressionModel:
         plt.tight_layout()
         plt.show()
 
-    def plot_train_vs_test_error_distribution(
+    def plot_train_vs_validation_error_distribution(
         self,
         bins: int = 30,
     ) -> None:
         """
-        Compare train and test residual distributions.
+        Compare train and validation residual distributions.
         """
         self._ensure_trained()
 
@@ -1551,9 +1575,9 @@ class TimeSeriesRegressionModel:
             - self.y_train_pred
         )
 
-        test_residuals = (
-            np.asarray(self.y_test)
-            - self.y_test_pred
+        validation_residuals = (
+            np.asarray(self.y_validation)
+            - self.y_validation_pred
         )
 
         plt.figure(figsize=(8, 5))
@@ -1566,10 +1590,10 @@ class TimeSeriesRegressionModel:
         )
 
         plt.hist(
-            test_residuals,
+            validation_residuals,
             bins=bins,
             alpha=0.45,
-            label="Test",
+            label="Validation",
         )
 
         plt.axvline(
@@ -1583,7 +1607,7 @@ class TimeSeriesRegressionModel:
         plt.ylabel("Frequency")
 
         plt.title(
-            f"Train vs Test Error Distribution — "
+            f"Train vs Validation Error Distribution — "
             f"{self.model_name}"
         )
 
@@ -1594,7 +1618,7 @@ class TimeSeriesRegressionModel:
     def plot_predictions_by_series(
         self,
         group_id: Any,
-        dataset: str = "test",
+        dataset: str = "validation",
     ) -> None:
         """
         Plot actual and predicted target values for one series.
@@ -1660,7 +1684,7 @@ class TimeSeriesRegressionModel:
     def plot_absolute_error_by_series(
         self,
         group_id: Any,
-        dataset: str = "test",
+        dataset: str = "validation",
     ) -> None:
         """
         Plot absolute prediction error for one complete series.

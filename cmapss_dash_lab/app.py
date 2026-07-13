@@ -1,18 +1,24 @@
-
 from __future__ import annotations
 
 import json
 import traceback
-from pathlib import Path
 from typing import Any
 
 import dash
 import dash_bootstrap_components as dbc
-import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from dash import Input, Output, State, callback, dash_table, dcc, html, no_update
+from dash import (
+    Input,
+    Output,
+    State,
+    callback,
+    dash_table,
+    dcc,
+    html,
+    no_update,
+)
 from dash.exceptions import PreventUpdate
 
 from services import (
@@ -22,9 +28,10 @@ from services import (
     load_project_classes,
 )
 
-# ---------------------------------------------------------------------
+
+# =====================================================================
 # Application setup
-# ---------------------------------------------------------------------
+# =====================================================================
 
 app = dash.Dash(
     __name__,
@@ -32,6 +39,7 @@ app = dash.Dash(
     suppress_callback_exceptions=True,
     title="C-MAPSS Experiment Lab",
 )
+
 server = app.server
 
 PROJECT_CLASSES, IMPORT_ERROR = load_project_classes()
@@ -44,13 +52,22 @@ DATASET_OPTIONS = [
     {"label": "FD004", "value": "FD004"},
 ]
 
-METRIC_COLUMNS = ["MAE", "RMSE", "R2", "MAPE", "Bias"]
 
+# =====================================================================
+# Reusable UI helpers
+# =====================================================================
 
-def card(title: str, body: Any, class_name: str = "") -> dbc.Card:
+def card(
+    title: str,
+    body: Any,
+    class_name: str = "",
+) -> dbc.Card:
     return dbc.Card(
         [
-            dbc.CardHeader(title, className="fw-semibold"),
+            dbc.CardHeader(
+                title,
+                className="fw-semibold",
+            ),
             dbc.CardBody(body),
         ],
         className=f"shadow-sm h-100 {class_name}".strip(),
@@ -74,32 +91,420 @@ def number_input(
     )
 
 
-# ---------------------------------------------------------------------
-# Layout sections
-# ---------------------------------------------------------------------
+def metric_card(
+    title: str,
+    component_id: str,
+    description: str,
+) -> dbc.Card:
+    return dbc.Card(
+        dbc.CardBody(
+            [
+                html.Div(
+                    title,
+                    className="metric-label",
+                ),
+                html.Div(
+                    "—",
+                    id=component_id,
+                    className="metric-value",
+                ),
+                html.Div(
+                    description,
+                    className="small text-secondary mt-1",
+                ),
+            ]
+        ),
+        className="shadow-sm h-100",
+    )
+
+
+def empty_figure(title: str) -> go.Figure:
+    return go.Figure().update_layout(
+        title=title,
+        annotations=[
+            {
+                "text": "No results available",
+                "showarrow": False,
+            }
+        ],
+    )
+
+
+def parse_csv_names(
+    value: str | None,
+) -> list[str] | None:
+    if not value or not value.strip():
+        return None
+
+    return [
+        item.strip()
+        for item in value.split(",")
+        if item.strip()
+    ]
+
+
+def safe_json(
+    value: str | None,
+) -> dict[str, Any]:
+    if not value or not value.strip():
+        return {}
+
+    parsed = json.loads(value)
+
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            "Model parameters must be a JSON object."
+        )
+
+    return parsed
+
+
+def format_metric(value: Any) -> str:
+    if value is None:
+        return "—"
+
+    try:
+        return f"{float(value):.4f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def split_metrics(
+    metrics: dict[str, Any],
+    split_name: str,
+) -> dict[str, Any]:
+    values = metrics.get(split_name, {})
+
+    return values if isinstance(values, dict) else {}
+
+
+def metrics_dataframe(
+    metrics: dict[str, Any],
+) -> pd.DataFrame:
+    rows = []
+
+    display_names = {
+        "train": "Train",
+        "validation": "Validation",
+        "external_test": "Official test",
+    }
+
+    for split_name in (
+        "train",
+        "validation",
+        "external_test",
+    ):
+        values = metrics.get(split_name)
+
+        if not isinstance(values, dict):
+            continue
+
+        row: dict[str, Any] = {
+            "split": display_names[split_name],
+        }
+
+        for metric_name in (
+            "MAE",
+            "RMSE",
+            "R2",
+            "MAPE",
+            "Bias",
+        ):
+            if metric_name in values:
+                row[metric_name] = values[metric_name]
+
+        if "motor_count" in values:
+            row["motor_count"] = values["motor_count"]
+
+        if "evaluation_method" in values:
+            row["evaluation_method"] = values[
+                "evaluation_method"
+            ]
+
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def metric_comparison_figure(
+    metrics: dict[str, Any],
+    metric_name: str = "RMSE",
+) -> go.Figure:
+    frame = metrics_dataframe(metrics)
+
+    if (
+        frame.empty
+        or metric_name not in frame.columns
+    ):
+        return empty_figure(
+            f"{metric_name} by dataset split"
+        )
+
+    frame = frame.dropna(
+        subset=[metric_name]
+    )
+
+    return px.bar(
+        frame,
+        x="split",
+        y=metric_name,
+        title=f"{metric_name}: train vs validation vs official test",
+        text_auto=".3f",
+    )
+
+
+def prediction_figure(
+    predictions: pd.DataFrame | None,
+    title: str,
+) -> go.Figure:
+    if predictions is None or predictions.empty:
+        return empty_figure(title)
+
+    predicted_column = (
+        "predicted"
+        if "predicted" in predictions.columns
+        else "predicted_RUL"
+        if "predicted_RUL" in predictions.columns
+        else None
+    )
+
+    if (
+        "actual" not in predictions.columns
+        or predicted_column is None
+    ):
+        return empty_figure(title)
+
+    frame = predictions[
+        ["actual", predicted_column]
+    ].dropna()
+
+    figure = px.scatter(
+        frame,
+        x="actual",
+        y=predicted_column,
+        opacity=0.5,
+        title=title,
+        labels={
+            "actual": "Actual RUL",
+            predicted_column: "Predicted RUL",
+        },
+    )
+
+    if not frame.empty:
+        lower = float(
+            min(
+                frame["actual"].min(),
+                frame[predicted_column].min(),
+            )
+        )
+        upper = float(
+            max(
+                frame["actual"].max(),
+                frame[predicted_column].max(),
+            )
+        )
+
+        figure.add_trace(
+            go.Scatter(
+                x=[lower, upper],
+                y=[lower, upper],
+                mode="lines",
+                name="Ideal prediction",
+                line={"dash": "dash"},
+            )
+        )
+
+    return figure
+
+
+def residual_figure(
+    predictions: pd.DataFrame | None,
+    title: str,
+) -> go.Figure:
+    if predictions is None or predictions.empty:
+        return empty_figure(title)
+
+    frame = predictions.copy()
+
+    predicted_column = (
+        "predicted"
+        if "predicted" in frame.columns
+        else "predicted_RUL"
+        if "predicted_RUL" in frame.columns
+        else None
+    )
+
+    if predicted_column is None:
+        return empty_figure(title)
+
+    if (
+        "residual" not in frame.columns
+        and "actual" in frame.columns
+    ):
+        frame["residual"] = (
+            frame["actual"]
+            - frame[predicted_column]
+        )
+
+    if "residual" not in frame.columns:
+        return empty_figure(title)
+
+    figure = px.scatter(
+        frame,
+        x=predicted_column,
+        y="residual",
+        opacity=0.5,
+        title=title,
+        labels={
+            predicted_column: "Predicted RUL",
+            "residual": "Actual - predicted",
+        },
+    )
+
+    figure.add_hline(
+        y=0,
+        line_dash="dash",
+    )
+
+    return figure
+
+
+def error_distribution_figure(
+    predictions: pd.DataFrame | None,
+    title: str,
+) -> go.Figure:
+    if predictions is None or predictions.empty:
+        return empty_figure(title)
+
+    frame = predictions.copy()
+
+    predicted_column = (
+        "predicted"
+        if "predicted" in frame.columns
+        else "predicted_RUL"
+        if "predicted_RUL" in frame.columns
+        else None
+    )
+
+    if (
+        "residual" not in frame.columns
+        and predicted_column is not None
+        and "actual" in frame.columns
+    ):
+        frame["residual"] = (
+            frame["actual"]
+            - frame[predicted_column]
+        )
+
+    if "residual" not in frame.columns:
+        return empty_figure(title)
+
+    return px.histogram(
+        frame,
+        x="residual",
+        nbins=50,
+        title=title,
+        labels={
+            "residual": "Actual - predicted",
+        },
+    )
+
+
+def history_figure(
+    history: pd.DataFrame | None,
+) -> go.Figure:
+    if history is None or history.empty:
+        return empty_figure(
+            "Training history — available for sequence models"
+        )
+
+    frame = history.reset_index(
+        names="epoch"
+    )
+
+    figure = go.Figure()
+
+    for column in (
+        "loss",
+        "val_loss",
+        "mae",
+        "val_mae",
+        "rmse",
+        "val_rmse",
+    ):
+        if column in frame.columns:
+            figure.add_trace(
+                go.Scatter(
+                    x=frame["epoch"],
+                    y=frame[column],
+                    mode="lines",
+                    name=column,
+                )
+            )
+
+    figure.update_layout(
+        title="Training and validation error by epoch",
+        xaxis_title="Epoch",
+        yaxis_title="Metric value",
+    )
+
+    return figure
+
+
+# =====================================================================
+# Sidebar
+# =====================================================================
 
 sidebar = html.Div(
     [
-        html.H3("C-MAPSS Lab", className="mb-1"),
+        html.H3(
+            "C-MAPSS Lab",
+            className="mb-1",
+        ),
         html.P(
-            "Train, save, reload, evaluate, and compare RUL experiments.",
+            "Train, validate, externally test, save, and compare RUL models.",
             className="text-secondary small",
         ),
         html.Hr(),
         dbc.Nav(
             [
-                dbc.NavLink("Experiment setup", href="#setup", external_link=True),
-                dbc.NavLink("Training results", href="#results", external_link=True),
-                dbc.NavLink("Saved experiments", href="#saved", external_link=True),
-                dbc.NavLink("Data explorer", href="#data", external_link=True),
+                dbc.NavLink(
+                    "Experiment setup",
+                    href="#setup",
+                    external_link=True,
+                ),
+                dbc.NavLink(
+                    "Development results",
+                    href="#development-results",
+                    external_link=True,
+                ),
+                dbc.NavLink(
+                    "Official test",
+                    href="#official-test",
+                    external_link=True,
+                ),
+                dbc.NavLink(
+                    "Saved experiments",
+                    href="#saved",
+                    external_link=True,
+                ),
+                dbc.NavLink(
+                    "Data explorer",
+                    href="#data",
+                    external_link=True,
+                ),
             ],
             vertical=True,
             pills=True,
         ),
         html.Hr(),
         dbc.Alert(
-            "Training runs synchronously in this starter dashboard. "
-            "For large neural networks, run the app behind a job queue.",
+            [
+                html.Strong("Workflow"),
+                html.Br(),
+                "Train files are split into train and validation motors. "
+                "The test and RUL files are used only in the official final test.",
+            ],
             color="info",
             className="small",
         ),
@@ -107,16 +512,27 @@ sidebar = html.Div(
     className="sidebar",
 )
 
+
+# =====================================================================
+# Experiment configuration
+# =====================================================================
+
 data_config_card = card(
-    "1. Data configuration",
+    "1. Training data",
     [
         dbc.Label("Raw data folder"),
         dbc.Input(
             id="data-folder",
             value="raw_data",
-            placeholder="Path containing train_FD001.txt, test_FD001.txt, ...",
+            placeholder=(
+                "Folder containing train_FD001.txt, "
+                "test_FD001.txt, and RUL_FD001.txt"
+            ),
         ),
-        dbc.Label("Training datasets", className="mt-3"),
+        dbc.Label(
+            "Training files",
+            className="mt-3",
+        ),
         dcc.Dropdown(
             id="datasets",
             options=DATASET_OPTIONS,
@@ -128,73 +544,143 @@ data_config_card = card(
             [
                 dbc.Col(
                     [
-                        dbc.Label("Remove nulls", className="mt-3"),
-                        dbc.Switch(id="remove-nulls", value=True),
+                        dbc.Label(
+                            "Remove nulls",
+                            className="mt-3",
+                        ),
+                        dbc.Switch(
+                            id="remove-nulls",
+                            value=True,
+                        ),
                     ]
                 ),
                 dbc.Col(
                     [
-                        dbc.Label("Clip RUL", className="mt-3"),
-                        dbc.Switch(id="clip-rul", value=False),
+                        dbc.Label(
+                            "Clip training RUL",
+                            className="mt-3",
+                        ),
+                        dbc.Switch(
+                            id="clip-rul",
+                            value=False,
+                        ),
                     ]
                 ),
             ]
         ),
-        dbc.Label("RUL cap", className="mt-3"),
-        number_input("rul-cap", 125, minimum=1, step=1),
-        dbc.Label("Target", className="mt-3"),
-        dbc.Input(id="target-column", value="RUL"),
-        dbc.Label("Group identifier", className="mt-3"),
-        dbc.Input(id="group-column", value="unique_motor_id"),
-        dbc.Label("Time column", className="mt-3"),
-        dbc.Input(id="time-column", value="cycle"),
+        dbc.Label(
+            "Training RUL cap",
+            className="mt-3",
+        ),
+        number_input(
+            "rul-cap",
+            125,
+            minimum=1,
+        ),
+        dbc.Label(
+            "Target column",
+            className="mt-3",
+        ),
+        dbc.Input(
+            id="target-column",
+            value="RUL",
+        ),
+        dbc.Label(
+            "Motor identifier",
+            className="mt-3",
+        ),
+        dbc.Input(
+            id="group-column",
+            value="unique_motor_id",
+        ),
+        dbc.Label(
+            "Cycle column",
+            className="mt-3",
+        ),
+        dbc.Input(
+            id="time-column",
+            value="cycle",
+        ),
     ],
 )
 
+
 model_config_card = card(
-    "2. Model configuration",
+    "2. Model",
     [
         dbc.Label("Model family"),
         dcc.RadioItems(
             id="model-family",
             options=[
-                {"label": "Tabular / scikit-learn", "value": "tabular"},
-                {"label": "Sequence / TensorFlow", "value": "sequence"},
+                {
+                    "label": "Tabular / scikit-learn",
+                    "value": "tabular",
+                },
+                {
+                    "label": "Sequence / TensorFlow",
+                    "value": "sequence",
+                },
             ],
             value="tabular",
-            labelStyle={"display": "block", "marginBottom": "0.4rem"},
+            labelStyle={
+                "display": "block",
+                "marginBottom": "0.4rem",
+            },
         ),
-        dbc.Label("Model", className="mt-3"),
+        dbc.Label(
+            "Model type",
+            className="mt-3",
+        ),
         dcc.Dropdown(
             id="model-name",
             options=[
-                {"label": value.replace("_", " ").title(), "value": value}
+                {
+                    "label": value.replace(
+                        "_",
+                        " ",
+                    ).title(),
+                    "value": value,
+                }
                 for value in AVAILABLE_TABULAR_MODELS
             ],
             value="hist_gradient_boosting",
             clearable=False,
         ),
-        dbc.Label("Experiment name", className="mt-3"),
+        dbc.Label(
+            "Experiment name",
+            className="mt-3",
+        ),
         dbc.Input(
             id="experiment-name",
-            placeholder="Leave blank to generate a timestamped name",
+            placeholder=(
+                "Leave blank to create a timestamped name"
+            ),
         ),
-        dbc.Label("Columns to drop", className="mt-3"),
+        dbc.Label(
+            "Columns to exclude",
+            className="mt-3",
+        ),
         dbc.Input(
             id="columns-to-drop",
             value="dataset,unit_number",
-            placeholder="Comma-separated names",
+            placeholder="Comma-separated columns",
         ),
-        dbc.Label("Feature columns", className="mt-3"),
+        dbc.Label(
+            "Feature columns",
+            className="mt-3",
+        ),
         dbc.Textarea(
             id="feature-columns",
             placeholder=(
-                "Optional comma-separated list. Leave blank to use the "
-                "class defaults."
+                "Optional comma-separated list. "
+                "Leave blank to use numeric columns."
             ),
             rows=3,
         ),
-        dbc.Label("Model parameters (JSON)", className="mt-3"),
+        dbc.Label(
+            "Model parameters (JSON)",
+            className="mt-3",
+        ),
         dbc.Textarea(
             id="model-params",
             value="{}",
@@ -204,40 +690,55 @@ model_config_card = card(
     ],
 )
 
+
 split_config_card = card(
-    "3. Split and training",
+    "3. Train and validation",
     [
-        dbc.Row(
-            [
-                dbc.Col(
-                    [
-                        dbc.Label("Test motors"),
-                        number_input("test-group-count", 10, minimum=1),
-                    ]
-                ),
-                dbc.Col(
-                    [
-                        dbc.Label("Validation motors"),
-                        number_input("validation-group-count", 10, minimum=1),
-                    ],
-                    id="validation-count-container",
-                    style={"display": "none"},
-                ),
-            ]
+        dbc.Alert(
+            "Validation motors are selected only from the training files.",
+            color="light",
+            className="small",
         ),
-        dbc.Label("Group selection", className="mt-3"),
+        dbc.Label(
+            "Validation motors",
+        ),
+        number_input(
+            "validation-group-count",
+            10,
+            minimum=1,
+        ),
+        dbc.Label(
+            "Motor selection",
+            className="mt-3",
+        ),
         dcc.Dropdown(
             id="group-selection",
             options=[
-                {"label": "Random", "value": "random"},
-                {"label": "First groups", "value": "first"},
-                {"label": "Last groups", "value": "last"},
+                {
+                    "label": "Random motors",
+                    "value": "random",
+                },
+                {
+                    "label": "First motors",
+                    "value": "first",
+                },
+                {
+                    "label": "Last motors",
+                    "value": "last",
+                },
             ],
             value="random",
             clearable=False,
         ),
-        dbc.Label("Random seed", className="mt-3"),
-        number_input("random-state", 42, minimum=0),
+        dbc.Label(
+            "Random seed",
+            className="mt-3",
+        ),
+        number_input(
+            "random-state",
+            42,
+            minimum=0,
+        ),
         html.Div(
             [
                 html.Hr(),
@@ -246,8 +747,14 @@ split_config_card = card(
                 dcc.Dropdown(
                     id="window-type",
                     options=[
-                        {"label": "Sliding", "value": "sliding"},
-                        {"label": "Growing", "value": "growing"},
+                        {
+                            "label": "Sliding",
+                            "value": "sliding",
+                        },
+                        {
+                            "label": "Growing",
+                            "value": "growing",
+                        },
                     ],
                     value="sliding",
                     clearable=False,
@@ -256,14 +763,28 @@ split_config_card = card(
                     [
                         dbc.Col(
                             [
-                                dbc.Label("Window size", className="mt-3"),
-                                number_input("window-size", 30, minimum=2),
+                                dbc.Label(
+                                    "Window size",
+                                    className="mt-3",
+                                ),
+                                number_input(
+                                    "window-size",
+                                    30,
+                                    minimum=2,
+                                ),
                             ]
                         ),
                         dbc.Col(
                             [
-                                dbc.Label("Minimum window", className="mt-3"),
-                                number_input("min-window-size", 10, minimum=2),
+                                dbc.Label(
+                                    "Minimum window",
+                                    className="mt-3",
+                                ),
+                                number_input(
+                                    "min-window-size",
+                                    10,
+                                    minimum=2,
+                                ),
                             ]
                         ),
                     ]
@@ -272,28 +793,64 @@ split_config_card = card(
                     [
                         dbc.Col(
                             [
-                                dbc.Label("Maximum window", className="mt-3"),
-                                number_input("max-window-size", 60, minimum=2),
+                                dbc.Label(
+                                    "Maximum window",
+                                    className="mt-3",
+                                ),
+                                number_input(
+                                    "max-window-size",
+                                    60,
+                                    minimum=2,
+                                ),
                             ]
                         ),
                         dbc.Col(
                             [
-                                dbc.Label("Stride", className="mt-3"),
-                                number_input("stride", 1, minimum=1),
+                                dbc.Label(
+                                    "Stride",
+                                    className="mt-3",
+                                ),
+                                number_input(
+                                    "stride",
+                                    1,
+                                    minimum=1,
+                                ),
                             ]
                         ),
                     ]
                 ),
-                dbc.Label("Prediction horizon", className="mt-3"),
-                number_input("prediction-horizon", 0, minimum=0),
-                dbc.Label("Scaler", className="mt-3"),
+                dbc.Label(
+                    "Prediction horizon",
+                    className="mt-3",
+                ),
+                number_input(
+                    "prediction-horizon",
+                    0,
+                    minimum=0,
+                ),
+                dbc.Label(
+                    "Scaler",
+                    className="mt-3",
+                ),
                 dcc.Dropdown(
                     id="scaler",
                     options=[
-                        {"label": "Standard", "value": "standard"},
-                        {"label": "Min-Max", "value": "minmax"},
-                        {"label": "Robust", "value": "robust"},
-                        {"label": "None", "value": "none"},
+                        {
+                            "label": "Standard",
+                            "value": "standard",
+                        },
+                        {
+                            "label": "Min-Max",
+                            "value": "minmax",
+                        },
+                        {
+                            "label": "Robust",
+                            "value": "robust",
+                        },
+                        {
+                            "label": "None",
+                            "value": "none",
+                        },
                     ],
                     value="standard",
                     clearable=False,
@@ -302,14 +859,28 @@ split_config_card = card(
                     [
                         dbc.Col(
                             [
-                                dbc.Label("Epochs", className="mt-3"),
-                                number_input("epochs", 100, minimum=1),
+                                dbc.Label(
+                                    "Epochs",
+                                    className="mt-3",
+                                ),
+                                number_input(
+                                    "epochs",
+                                    100,
+                                    minimum=1,
+                                ),
                             ]
                         ),
                         dbc.Col(
                             [
-                                dbc.Label("Batch size", className="mt-3"),
-                                number_input("batch-size", 64, minimum=1),
+                                dbc.Label(
+                                    "Batch size",
+                                    className="mt-3",
+                                ),
+                                number_input(
+                                    "batch-size",
+                                    64,
+                                    minimum=1,
+                                ),
                             ]
                         ),
                     ]
@@ -318,7 +889,10 @@ split_config_card = card(
                     [
                         dbc.Col(
                             [
-                                dbc.Label("Learning rate", className="mt-3"),
+                                dbc.Label(
+                                    "Learning rate",
+                                    className="mt-3",
+                                ),
                                 number_input(
                                     "learning-rate",
                                     0.001,
@@ -329,19 +903,38 @@ split_config_card = card(
                         ),
                         dbc.Col(
                             [
-                                dbc.Label("Patience", className="mt-3"),
-                                number_input("patience", 12, minimum=1),
+                                dbc.Label(
+                                    "Patience",
+                                    className="mt-3",
+                                ),
+                                number_input(
+                                    "patience",
+                                    12,
+                                    minimum=1,
+                                ),
                             ]
                         ),
                     ]
                 ),
-                dbc.Label("Loss", className="mt-3"),
+                dbc.Label(
+                    "Loss",
+                    className="mt-3",
+                ),
                 dcc.Dropdown(
                     id="loss",
                     options=[
-                        {"label": "Huber", "value": "huber"},
-                        {"label": "Mean squared error", "value": "mse"},
-                        {"label": "Mean absolute error", "value": "mae"},
+                        {
+                            "label": "Huber",
+                            "value": "huber",
+                        },
+                        {
+                            "label": "Mean squared error",
+                            "value": "mse",
+                        },
+                        {
+                            "label": "Mean absolute error",
+                            "value": "mae",
+                        },
                     ],
                     value="huber",
                     clearable=False,
@@ -351,13 +944,13 @@ split_config_card = card(
             style={"display": "none"},
         ),
         dbc.Button(
-            "Run experiment",
+            "Train experiment",
             id="run-experiment",
             color="primary",
             className="mt-4 w-100",
         ),
         dbc.Button(
-            "Preview data",
+            "Preview training data",
             id="preview-data",
             color="secondary",
             outline=True,
@@ -366,63 +959,340 @@ split_config_card = card(
     ],
 )
 
-metrics_cards = dbc.Row(
+
+# =====================================================================
+# Development metrics
+# =====================================================================
+
+development_metric_cards = dbc.Row(
     [
         dbc.Col(
-            dbc.Card(
-                dbc.CardBody(
-                    [html.Div(metric, className="metric-label"),
-                     html.Div("—", id=f"metric-{metric.lower()}", className="metric-value")]
-                ),
-                className="shadow-sm",
+            metric_card(
+                "Train MAE",
+                "train-mae",
+                "Error on motors used to fit the model",
             ),
-            md=True,
-        )
-        for metric in ["MAE", "RMSE", "R2", "Bias"]
+            md=3,
+        ),
+        dbc.Col(
+            metric_card(
+                "Validation MAE",
+                "validation-mae",
+                "Error on held-out training-file motors",
+            ),
+            md=3,
+        ),
+        dbc.Col(
+            metric_card(
+                "Train RMSE",
+                "train-rmse",
+                "Training error with stronger penalty for large misses",
+            ),
+            md=3,
+        ),
+        dbc.Col(
+            metric_card(
+                "Validation RMSE",
+                "validation-rmse",
+                "Primary development comparison metric",
+            ),
+            md=3,
+        ),
     ],
     className="g-3 mb-3",
 )
 
-results_section = html.Div(
+
+development_results_section = html.Div(
     [
-        html.H3("Training results", id="results"),
-        metrics_cards,
+        html.H3(
+            "Development results",
+            id="development-results",
+        ),
+        html.P(
+            "These metrics use only train_FD00X files. "
+            "Validation motors are unseen during fitting.",
+            className="text-secondary",
+        ),
+        development_metric_cards,
         dbc.Row(
             [
-                dbc.Col(dcc.Graph(id="prediction-graph"), lg=6),
-                dbc.Col(dcc.Graph(id="residual-graph"), lg=6),
+                dbc.Col(
+                    dcc.Graph(
+                        id="development-metric-comparison",
+                    ),
+                    lg=6,
+                ),
+                dbc.Col(
+                    dcc.Graph(
+                        id="history-graph",
+                    ),
+                    lg=6,
+                ),
             ]
         ),
         dbc.Row(
             [
-                dbc.Col(dcc.Graph(id="error-distribution"), lg=6),
-                dbc.Col(dcc.Graph(id="history-graph"), lg=6),
+                dbc.Col(
+                    dcc.Graph(
+                        id="validation-prediction-graph",
+                    ),
+                    lg=6,
+                ),
+                dbc.Col(
+                    dcc.Graph(
+                        id="validation-residual-graph",
+                    ),
+                    lg=6,
+                ),
+            ]
+        ),
+        dbc.Row(
+            [
+                dbc.Col(
+                    dcc.Graph(
+                        id="train-residual-graph",
+                    ),
+                    lg=6,
+                ),
+                dbc.Col(
+                    dcc.Graph(
+                        id="validation-error-distribution",
+                    ),
+                    lg=6,
+                ),
             ]
         ),
         card(
-            "Metrics by split",
+            "Train and validation metrics",
             dash_table.DataTable(
-                id="metrics-table",
+                id="development-metrics-table",
                 page_size=10,
                 sort_action="native",
-                style_table={"overflowX": "auto"},
-                style_cell={"padding": "8px", "textAlign": "left"},
+                style_table={
+                    "overflowX": "auto",
+                },
+                style_cell={
+                    "padding": "8px",
+                    "textAlign": "left",
+                },
             ),
         ),
-        html.Div(id="run-status", className="mt-3"),
+        html.Div(
+            id="run-status",
+            className="mt-3",
+        ),
     ],
     className="content-section",
 )
 
+
+# =====================================================================
+# Official external test
+# =====================================================================
+
+external_test_configuration = card(
+    "Official test configuration",
+    [
+        dbc.Alert(
+            [
+                html.Strong("Final evaluation only. "),
+                "The model uses test_FD00X sensor histories and compares "
+                "one final prediction per motor with RUL_FD00X.",
+            ],
+            color="warning",
+            className="small",
+        ),
+        dbc.Label("Test datasets"),
+        dcc.Dropdown(
+            id="external-test-datasets",
+            options=DATASET_OPTIONS,
+            value=["FD001"],
+            multi=True,
+            clearable=False,
+        ),
+        dbc.Label(
+            "External RUL treatment",
+            className="mt-3",
+        ),
+        dcc.RadioItems(
+            id="external-rul-mode",
+            options=[
+                {
+                    "label": "Use the same clipping as training",
+                    "value": "same",
+                },
+                {
+                    "label": "Do not clip external RUL",
+                    "value": "none",
+                },
+                {
+                    "label": "Use a custom cap",
+                    "value": "custom",
+                },
+            ],
+            value="same",
+            labelStyle={
+                "display": "block",
+                "marginBottom": "0.35rem",
+            },
+        ),
+        dbc.Label(
+            "Custom external RUL cap",
+            className="mt-3",
+        ),
+        number_input(
+            "external-rul-cap",
+            125,
+            minimum=1,
+        ),
+        dbc.Button(
+            "Run official test",
+            id="run-external-test",
+            color="danger",
+            className="mt-4 w-100",
+        ),
+    ],
+)
+
+
+external_test_metric_cards = dbc.Row(
+    [
+        dbc.Col(
+            metric_card(
+                "Official test MAE",
+                "external-mae",
+                "Average final RUL error per external motor",
+            ),
+            md=3,
+        ),
+        dbc.Col(
+            metric_card(
+                "Official test RMSE",
+                "external-rmse",
+                "Final error with stronger penalty for large misses",
+            ),
+            md=3,
+        ),
+        dbc.Col(
+            metric_card(
+                "Official test R²",
+                "external-r2",
+                "Variance explained on the official test motors",
+            ),
+            md=3,
+        ),
+        dbc.Col(
+            metric_card(
+                "Official test bias",
+                "external-bias",
+                "Positive means underprediction on average",
+            ),
+            md=3,
+        ),
+    ],
+    className="g-3 mb-3",
+)
+
+
+official_test_section = html.Div(
+    [
+        html.H3(
+            "Official final test",
+            id="official-test",
+        ),
+        dbc.Row(
+            [
+                dbc.Col(
+                    external_test_configuration,
+                    lg=4,
+                ),
+                dbc.Col(
+                    [
+                        external_test_metric_cards,
+                        dcc.Graph(
+                            id="all-splits-metric-comparison",
+                        ),
+                    ],
+                    lg=8,
+                ),
+            ],
+            className="g-3",
+        ),
+        dbc.Row(
+            [
+                dbc.Col(
+                    dcc.Graph(
+                        id="external-prediction-graph",
+                    ),
+                    lg=6,
+                ),
+                dbc.Col(
+                    dcc.Graph(
+                        id="external-residual-graph",
+                    ),
+                    lg=6,
+                ),
+            ]
+        ),
+        dbc.Row(
+            [
+                dbc.Col(
+                    dcc.Graph(
+                        id="external-error-distribution",
+                    ),
+                    lg=6,
+                ),
+                dbc.Col(
+                    dcc.Graph(
+                        id="validation-vs-external-residuals",
+                    ),
+                    lg=6,
+                ),
+            ]
+        ),
+        card(
+            "Official test metrics",
+            dash_table.DataTable(
+                id="external-metrics-table",
+                page_size=10,
+                sort_action="native",
+                style_table={
+                    "overflowX": "auto",
+                },
+                style_cell={
+                    "padding": "8px",
+                    "textAlign": "left",
+                },
+            ),
+        ),
+        html.Div(
+            id="external-test-status",
+            className="mt-3",
+        ),
+    ],
+    className="content-section",
+)
+
+
+# =====================================================================
+# Saved experiments
+# =====================================================================
+
 saved_section = html.Div(
     [
-        html.H3("Saved experiments", id="saved"),
+        html.H3(
+            "Saved experiments",
+            id="saved",
+        ),
         dbc.Row(
             [
                 dbc.Col(
                     dcc.Dropdown(
                         id="saved-experiment-selector",
-                        placeholder="Select one or more experiments",
+                        placeholder=(
+                            "Select one or more experiments"
+                        ),
                         multi=True,
                     ),
                     lg=8,
@@ -449,7 +1319,10 @@ saved_section = html.Div(
             ],
             className="g-2",
         ),
-        dcc.Graph(id="comparison-graph", className="mt-3"),
+        dcc.Graph(
+            id="comparison-graph",
+            className="mt-3",
+        ),
         card(
             "Experiment comparison",
             dash_table.DataTable(
@@ -457,32 +1330,60 @@ saved_section = html.Div(
                 page_size=15,
                 sort_action="native",
                 filter_action="native",
-                style_table={"overflowX": "auto"},
-                style_cell={"padding": "8px", "textAlign": "left"},
+                style_table={
+                    "overflowX": "auto",
+                },
+                style_cell={
+                    "padding": "8px",
+                    "textAlign": "left",
+                },
             ),
         ),
-        html.Div(id="load-status", className="mt-3"),
+        html.Div(
+            id="load-status",
+            className="mt-3",
+        ),
     ],
     className="content-section",
 )
 
+
+# =====================================================================
+# Data explorer
+# =====================================================================
+
 data_section = html.Div(
     [
-        html.H3("Data explorer", id="data"),
+        html.H3(
+            "Data explorer",
+            id="data",
+        ),
         dbc.Row(
             [
-                dbc.Col(dcc.Graph(id="rul-distribution"), lg=6),
-                dbc.Col(dcc.Graph(id="motor-length-graph"), lg=6),
+                dbc.Col(
+                    dcc.Graph(
+                        id="rul-distribution",
+                    ),
+                    lg=6,
+                ),
+                dbc.Col(
+                    dcc.Graph(
+                        id="motor-length-graph",
+                    ),
+                    lg=6,
+                ),
             ]
         ),
         card(
-            "Dataset preview",
+            "Training dataset preview",
             dash_table.DataTable(
                 id="data-table",
                 page_size=15,
                 sort_action="native",
                 filter_action="native",
-                style_table={"overflowX": "auto"},
+                style_table={
+                    "overflowX": "auto",
+                },
                 style_cell={
                     "padding": "7px",
                     "fontFamily": "monospace",
@@ -494,24 +1395,41 @@ data_section = html.Div(
                 },
             ),
         ),
-        html.Div(id="preview-status", className="mt-3"),
+        html.Div(
+            id="preview-status",
+            className="mt-3",
+        ),
     ],
     className="content-section",
 )
 
+
+# =====================================================================
+# Complete layout
+# =====================================================================
+
 app.layout = html.Div(
     [
-        dcc.Store(id="latest-experiment-name"),
-        dcc.Store(id="latest-results-store"),
+        dcc.Store(
+            id="latest-experiment-name",
+        ),
+        dcc.Store(
+            id="latest-development-metrics",
+        ),
+        dcc.Store(
+            id="latest-validation-predictions",
+        ),
         sidebar,
         html.Main(
             [
                 html.Div(
                     [
-                        html.H2("Predictive Maintenance Experiment Dashboard"),
+                        html.H2(
+                            "Predictive Maintenance Experiment Dashboard"
+                        ),
                         html.P(
-                            "Configure C-MAPSS data, train tabular or sequence "
-                            "models, persist experiments, and inspect diagnostics.",
+                            "Develop with train and validation motors, then "
+                            "run one separate official test using test + RUL files.",
                             className="text-secondary",
                         ),
                     ],
@@ -519,12 +1437,24 @@ app.layout = html.Div(
                 ),
                 html.Div(
                     [
-                        html.H3("Experiment setup", id="setup"),
+                        html.H3(
+                            "Experiment setup",
+                            id="setup",
+                        ),
                         dbc.Row(
                             [
-                                dbc.Col(data_config_card, lg=4),
-                                dbc.Col(model_config_card, lg=4),
-                                dbc.Col(split_config_card, lg=4),
+                                dbc.Col(
+                                    data_config_card,
+                                    lg=4,
+                                ),
+                                dbc.Col(
+                                    model_config_card,
+                                    lg=4,
+                                ),
+                                dbc.Col(
+                                    split_config_card,
+                                    lg=4,
+                                ),
                             ],
                             className="g-3",
                         ),
@@ -532,7 +1462,9 @@ app.layout = html.Div(
                     className="content-section",
                 ),
                 html.Hr(),
-                results_section,
+                development_results_section,
+                html.Hr(),
+                official_test_section,
                 html.Hr(),
                 saved_section,
                 html.Hr(),
@@ -544,94 +1476,102 @@ app.layout = html.Div(
 )
 
 
-# ---------------------------------------------------------------------
-# UI utility callbacks
-# ---------------------------------------------------------------------
+# =====================================================================
+# Configuration callbacks
+# =====================================================================
 
 @callback(
-    Output("model-name", "options"),
-    Output("model-name", "value"),
-    Output("sequence-settings", "style"),
-    Output("validation-count-container", "style"),
-    Input("model-family", "value"),
+    Output(
+        "model-name",
+        "options",
+    ),
+    Output(
+        "model-name",
+        "value",
+    ),
+    Output(
+        "sequence-settings",
+        "style",
+    ),
+    Input(
+        "model-family",
+        "value",
+    ),
 )
-def update_model_family(model_family: str):
+def update_model_family(
+    model_family: str,
+):
     if model_family == "sequence":
         options = [
-            {"label": value.replace("_", " ").upper(), "value": value}
+            {
+                "label": value.replace(
+                    "_",
+                    " ",
+                ).upper(),
+                "value": value,
+            }
             for value in AVAILABLE_SEQUENCE_MODELS
         ]
-        return options, "lstm", {"display": "block"}, {"display": "block"}
+
+        return (
+            options,
+            "lstm",
+            {"display": "block"},
+        )
 
     options = [
-        {"label": value.replace("_", " ").title(), "value": value}
+        {
+            "label": value.replace(
+                "_",
+                " ",
+            ).title(),
+            "value": value,
+        }
         for value in AVAILABLE_TABULAR_MODELS
     ]
+
     return (
         options,
         "hist_gradient_boosting",
-        {"display": "none"},
         {"display": "none"},
     )
 
 
 @callback(
-    Output("rul-cap", "disabled"),
-    Input("clip-rul", "value"),
+    Output(
+        "rul-cap",
+        "disabled",
+    ),
+    Input(
+        "clip-rul",
+        "value",
+    ),
 )
-def toggle_rul_cap(clip_rul: bool):
+def toggle_rul_cap(
+    clip_rul: bool,
+):
     return not clip_rul
 
 
-def parse_csv_names(value: str | None) -> list[str] | None:
-    if not value or not value.strip():
-        return None
-    return [item.strip() for item in value.split(",") if item.strip()]
+@callback(
+    Output(
+        "external-rul-cap",
+        "disabled",
+    ),
+    Input(
+        "external-rul-mode",
+        "value",
+    ),
+)
+def toggle_external_rul_cap(
+    mode: str,
+):
+    return mode != "custom"
 
 
-def safe_json(value: str | None) -> dict[str, Any]:
-    if not value or not value.strip():
-        return {}
-    parsed = json.loads(value)
-    if not isinstance(parsed, dict):
-        raise ValueError("Model parameters must be a JSON object.")
-    return parsed
-
-
-def create_run_config(state_values: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "data_folder": state_values["data_folder"],
-        "datasets": state_values["datasets"],
-        "remove_nulls": state_values["remove_nulls"],
-        "clip_rul": state_values["clip_rul"],
-        "rul_cap": int(state_values["rul_cap"]),
-        "target_column": state_values["target_column"],
-        "group_column": state_values["group_column"],
-        "time_column": state_values["time_column"],
-        "model_family": state_values["model_family"],
-        "model_name": state_values["model_name"],
-        "experiment_name": state_values["experiment_name"] or None,
-        "columns_to_drop": parse_csv_names(state_values["columns_to_drop"]) or [],
-        "feature_columns": parse_csv_names(state_values["feature_columns"]),
-        "model_params": safe_json(state_values["model_params"]),
-        "test_group_count": int(state_values["test_group_count"]),
-        "validation_group_count": int(state_values["validation_group_count"]),
-        "group_selection": state_values["group_selection"],
-        "random_state": int(state_values["random_state"]),
-        "window_type": state_values["window_type"],
-        "window_size": int(state_values["window_size"]),
-        "min_window_size": int(state_values["min_window_size"]),
-        "max_window_size": int(state_values["max_window_size"]),
-        "stride": int(state_values["stride"]),
-        "prediction_horizon": int(state_values["prediction_horizon"]),
-        "scaler": state_values["scaler"],
-        "epochs": int(state_values["epochs"]),
-        "batch_size": int(state_values["batch_size"]),
-        "learning_rate": float(state_values["learning_rate"]),
-        "patience": int(state_values["patience"]),
-        "loss": state_values["loss"],
-    }
-
+# =====================================================================
+# Training configuration extraction
+# =====================================================================
 
 RUN_STATES = [
     State("data-folder", "value"),
@@ -648,7 +1588,6 @@ RUN_STATES = [
     State("columns-to-drop", "value"),
     State("feature-columns", "value"),
     State("model-params", "value"),
-    State("test-group-count", "value"),
     State("validation-group-count", "value"),
     State("group-selection", "value"),
     State("random-state", "value"),
@@ -667,144 +1606,878 @@ RUN_STATES = [
 ]
 
 RUN_KEYS = [
-    "data_folder", "datasets", "remove_nulls", "clip_rul", "rul_cap",
-    "target_column", "group_column", "time_column", "model_family",
-    "model_name", "experiment_name", "columns_to_drop", "feature_columns",
-    "model_params", "test_group_count", "validation_group_count",
-    "group_selection", "random_state", "window_type", "window_size",
-    "min_window_size", "max_window_size", "stride", "prediction_horizon",
-    "scaler", "epochs", "batch_size", "learning_rate", "patience", "loss",
+    "data_folder",
+    "datasets",
+    "remove_nulls",
+    "clip_rul",
+    "rul_cap",
+    "target_column",
+    "group_column",
+    "time_column",
+    "model_family",
+    "model_name",
+    "experiment_name",
+    "columns_to_drop",
+    "feature_columns",
+    "model_params",
+    "validation_group_count",
+    "group_selection",
+    "random_state",
+    "window_type",
+    "window_size",
+    "min_window_size",
+    "max_window_size",
+    "stride",
+    "prediction_horizon",
+    "scaler",
+    "epochs",
+    "batch_size",
+    "learning_rate",
+    "patience",
+    "loss",
 ]
 
 
-# ---------------------------------------------------------------------
-# Main training callback
-# ---------------------------------------------------------------------
+def create_run_config(
+    state_values: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "data_folder": state_values[
+            "data_folder"
+        ],
+        "datasets": state_values["datasets"],
+        "remove_nulls": state_values[
+            "remove_nulls"
+        ],
+        "clip_rul": state_values["clip_rul"],
+        "rul_cap": int(state_values["rul_cap"]),
+        "target_column": state_values[
+            "target_column"
+        ],
+        "group_column": state_values[
+            "group_column"
+        ],
+        "time_column": state_values[
+            "time_column"
+        ],
+        "model_family": state_values[
+            "model_family"
+        ],
+        "model_name": state_values[
+            "model_name"
+        ],
+        "experiment_name": (
+            state_values["experiment_name"]
+            or None
+        ),
+        "columns_to_drop": (
+            parse_csv_names(
+                state_values["columns_to_drop"]
+            )
+            or []
+        ),
+        "feature_columns": parse_csv_names(
+            state_values["feature_columns"]
+        ),
+        "model_params": safe_json(
+            state_values["model_params"]
+        ),
+        "validation_group_count": int(
+            state_values[
+                "validation_group_count"
+            ]
+        ),
+        "group_selection": state_values[
+            "group_selection"
+        ],
+        "random_state": int(
+            state_values["random_state"]
+        ),
+        "window_type": state_values[
+            "window_type"
+        ],
+        "window_size": int(
+            state_values["window_size"]
+        ),
+        "min_window_size": int(
+            state_values["min_window_size"]
+        ),
+        "max_window_size": int(
+            state_values["max_window_size"]
+        ),
+        "stride": int(state_values["stride"]),
+        "prediction_horizon": int(
+            state_values["prediction_horizon"]
+        ),
+        "scaler": state_values["scaler"],
+        "epochs": int(state_values["epochs"]),
+        "batch_size": int(
+            state_values["batch_size"]
+        ),
+        "learning_rate": float(
+            state_values["learning_rate"]
+        ),
+        "patience": int(
+            state_values["patience"]
+        ),
+        "loss": state_values["loss"],
+    }
+
+
+# =====================================================================
+# Train callback
+# =====================================================================
 
 @callback(
-    Output("latest-experiment-name", "data"),
-    Output("latest-results-store", "data"),
-    Output("run-status", "children"),
-    Output("metric-mae", "children"),
-    Output("metric-rmse", "children"),
-    Output("metric-r2", "children"),
-    Output("metric-bias", "children"),
-    Output("metrics-table", "data"),
-    Output("metrics-table", "columns"),
-    Output("prediction-graph", "figure"),
-    Output("residual-graph", "figure"),
-    Output("error-distribution", "figure"),
-    Output("history-graph", "figure"),
-    Input("run-experiment", "n_clicks"),
+    Output(
+        "latest-experiment-name",
+        "data",
+    ),
+    Output(
+        "latest-development-metrics",
+        "data",
+    ),
+    Output(
+        "latest-validation-predictions",
+        "data",
+    ),
+    Output(
+        "run-status",
+        "children",
+    ),
+    Output(
+        "train-mae",
+        "children",
+    ),
+    Output(
+        "validation-mae",
+        "children",
+    ),
+    Output(
+        "train-rmse",
+        "children",
+    ),
+    Output(
+        "validation-rmse",
+        "children",
+    ),
+    Output(
+        "development-metrics-table",
+        "data",
+    ),
+    Output(
+        "development-metrics-table",
+        "columns",
+    ),
+    Output(
+        "development-metric-comparison",
+        "figure",
+    ),
+    Output(
+        "history-graph",
+        "figure",
+    ),
+    Output(
+        "validation-prediction-graph",
+        "figure",
+    ),
+    Output(
+        "validation-residual-graph",
+        "figure",
+    ),
+    Output(
+        "train-residual-graph",
+        "figure",
+    ),
+    Output(
+        "validation-error-distribution",
+        "figure",
+    ),
+    Input(
+        "run-experiment",
+        "n_clicks",
+    ),
     *RUN_STATES,
     prevent_initial_call=True,
     running=[
-        (Output("run-experiment", "disabled"), True, False),
-        (Output("run-experiment", "children"), "Training…", "Run experiment"),
+        (
+            Output(
+                "run-experiment",
+                "disabled",
+            ),
+            True,
+            False,
+        ),
+        (
+            Output(
+                "run-experiment",
+                "children",
+            ),
+            "Training…",
+            "Train experiment",
+        ),
     ],
 )
-def run_experiment(n_clicks: int, *values):
+def run_experiment(
+    n_clicks: int,
+    *values,
+):
     if not n_clicks:
         raise PreventUpdate
+
+    empty = empty_figure(
+        "No results available"
+    )
 
     if IMPORT_ERROR:
         alert = dbc.Alert(
             [
-                html.Strong("Project classes could not be imported. "),
-                html.Pre(IMPORT_ERROR, className="small mb-0"),
+                html.Strong(
+                    "Project classes could not be imported."
+                ),
+                html.Pre(
+                    IMPORT_ERROR,
+                    className="small mb-0",
+                ),
             ],
             color="danger",
         )
-        empty = go.Figure()
+
         return (
-            no_update, no_update, alert, "—", "—", "—", "—",
-            [], [], empty, empty, empty, empty,
+            no_update,
+            no_update,
+            no_update,
+            alert,
+            "—",
+            "—",
+            "—",
+            "—",
+            [],
+            [],
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
         )
 
     try:
-        config = create_run_config(dict(zip(RUN_KEYS, values)))
+        config = create_run_config(
+            dict(
+                zip(
+                    RUN_KEYS,
+                    values,
+                )
+            )
+        )
+
         outcome = SERVICE.run_and_save(config)
 
         metrics = outcome["metrics"]
-        predictions = outcome["predictions"]
+        train_predictions = outcome.get(
+            "train_predictions"
+        )
+        validation_predictions = outcome.get(
+            "validation_predictions"
+        )
         history = outcome.get("history")
-        experiment_name = outcome["experiment_name"]
+        experiment_name = outcome[
+            "experiment_name"
+        ]
 
-        metric_df = SERVICE.metrics_to_dataframe(metrics)
-        selected_metrics = SERVICE.select_primary_metrics(metrics)
+        train_values = split_metrics(
+            metrics,
+            "train",
+        )
+        validation_values = split_metrics(
+            metrics,
+            "validation",
+        )
 
-        prediction_fig = SERVICE.prediction_figure(predictions)
-        residual_fig = SERVICE.residual_figure(predictions)
-        distribution_fig = SERVICE.error_distribution_figure(predictions)
-        history_fig = SERVICE.history_figure(history)
-
-        serialized = {
-            "experiment_name": experiment_name,
-            "metrics": metrics,
-        }
+        metric_frame = metrics_dataframe(
+            metrics
+        )
 
         status = dbc.Alert(
-            f"Experiment '{experiment_name}' trained and saved successfully.",
+            (
+                f"Experiment '{experiment_name}' trained and saved. "
+                "The official test has not been run yet."
+            ),
             color="success",
+        )
+
+        validation_records = (
+            validation_predictions.to_dict(
+                "records"
+            )
+            if isinstance(
+                validation_predictions,
+                pd.DataFrame,
+            )
+            else None
         )
 
         return (
             experiment_name,
-            serialized,
+            metrics,
+            validation_records,
             status,
-            SERVICE.format_metric(selected_metrics.get("MAE")),
-            SERVICE.format_metric(selected_metrics.get("RMSE")),
-            SERVICE.format_metric(selected_metrics.get("R2")),
-            SERVICE.format_metric(selected_metrics.get("Bias")),
-            metric_df.to_dict("records"),
-            [{"name": col, "id": col} for col in metric_df.columns],
-            prediction_fig,
-            residual_fig,
-            distribution_fig,
-            history_fig,
+            format_metric(
+                train_values.get("MAE")
+            ),
+            format_metric(
+                validation_values.get("MAE")
+            ),
+            format_metric(
+                train_values.get("RMSE")
+            ),
+            format_metric(
+                validation_values.get("RMSE")
+            ),
+            metric_frame.to_dict("records"),
+            [
+                {
+                    "name": column,
+                    "id": column,
+                }
+                for column in metric_frame.columns
+            ],
+            metric_comparison_figure(
+                metrics,
+                "RMSE",
+            ),
+            history_figure(history),
+            prediction_figure(
+                validation_predictions,
+                "Validation: actual vs predicted RUL",
+            ),
+            residual_figure(
+                validation_predictions,
+                "Validation residuals",
+            ),
+            residual_figure(
+                train_predictions,
+                "Training residuals",
+            ),
+            error_distribution_figure(
+                validation_predictions,
+                "Validation error distribution",
+            ),
         )
 
     except Exception as exc:
         trace = traceback.format_exc()
+
         alert = dbc.Alert(
             [
-                html.Strong(f"{type(exc).__name__}: {exc}"),
+                html.Strong(
+                    f"{type(exc).__name__}: {exc}"
+                ),
                 html.Details(
                     [
-                        html.Summary("Show traceback"),
-                        html.Pre(trace, className="traceback"),
+                        html.Summary(
+                            "Show traceback"
+                        ),
+                        html.Pre(
+                            trace,
+                            className="traceback",
+                        ),
                     ]
                 ),
             ],
             color="danger",
         )
-        empty = go.Figure()
+
         return (
-            no_update, no_update, alert, "—", "—", "—", "—",
-            [], [], empty, empty, empty, empty,
+            no_update,
+            no_update,
+            no_update,
+            alert,
+            "—",
+            "—",
+            "—",
+            "—",
+            [],
+            [],
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
         )
 
 
-# ---------------------------------------------------------------------
-# Data preview callback
-# ---------------------------------------------------------------------
+# =====================================================================
+# Official test callback
+# =====================================================================
 
 @callback(
-    Output("data-table", "data"),
-    Output("data-table", "columns"),
-    Output("rul-distribution", "figure"),
-    Output("motor-length-graph", "figure"),
-    Output("preview-status", "children"),
-    Input("preview-data", "n_clicks"),
-    State("data-folder", "value"),
-    State("datasets", "value"),
-    State("remove-nulls", "value"),
-    State("clip-rul", "value"),
-    State("rul-cap", "value"),
+    Output(
+        "external-test-status",
+        "children",
+    ),
+    Output(
+        "external-mae",
+        "children",
+    ),
+    Output(
+        "external-rmse",
+        "children",
+    ),
+    Output(
+        "external-r2",
+        "children",
+    ),
+    Output(
+        "external-bias",
+        "children",
+    ),
+    Output(
+        "external-metrics-table",
+        "data",
+    ),
+    Output(
+        "external-metrics-table",
+        "columns",
+    ),
+    Output(
+        "all-splits-metric-comparison",
+        "figure",
+    ),
+    Output(
+        "external-prediction-graph",
+        "figure",
+    ),
+    Output(
+        "external-residual-graph",
+        "figure",
+    ),
+    Output(
+        "external-error-distribution",
+        "figure",
+    ),
+    Output(
+        "validation-vs-external-residuals",
+        "figure",
+    ),
+    Output(
+        "latest-development-metrics",
+        "data",
+        allow_duplicate=True,
+    ),
+    Input(
+        "run-external-test",
+        "n_clicks",
+    ),
+    State(
+        "latest-experiment-name",
+        "data",
+    ),
+    State(
+        "latest-development-metrics",
+        "data",
+    ),
+    State(
+        "latest-validation-predictions",
+        "data",
+    ),
+    State(
+        "data-folder",
+        "value",
+    ),
+    State(
+        "external-test-datasets",
+        "value",
+    ),
+    State(
+        "external-rul-mode",
+        "value",
+    ),
+    State(
+        "external-rul-cap",
+        "value",
+    ),
+    State(
+        "clip-rul",
+        "value",
+    ),
+    State(
+        "rul-cap",
+        "value",
+    ),
     prevent_initial_call=True,
     running=[
-        (Output("preview-data", "disabled"), True, False),
-        (Output("preview-data", "children"), "Loading…", "Preview data"),
+        (
+            Output(
+                "run-external-test",
+                "disabled",
+            ),
+            True,
+            False,
+        ),
+        (
+            Output(
+                "run-external-test",
+                "children",
+            ),
+            "Testing…",
+            "Run official test",
+        ),
+    ],
+)
+def run_external_test(
+    n_clicks: int,
+    experiment_name: str | None,
+    development_metrics: dict[str, Any] | None,
+    validation_prediction_records: list[dict[str, Any]] | None,
+    data_folder: str,
+    datasets: list[str],
+    rul_mode: str,
+    custom_cap: int,
+    training_clip_rul: bool,
+    training_rul_cap: int,
+):
+    if not n_clicks:
+        raise PreventUpdate
+
+    empty = empty_figure(
+        "No official test results"
+    )
+
+    if not experiment_name:
+        return (
+            dbc.Alert(
+                "Train or load an experiment before running the official test.",
+                color="warning",
+            ),
+            "—",
+            "—",
+            "—",
+            "—",
+            [],
+            [],
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+            no_update,
+        )
+
+    try:
+        if rul_mode == "same":
+            clip_rul = bool(
+                training_clip_rul
+            )
+            rul_cap = int(
+                training_rul_cap
+            )
+        elif rul_mode == "custom":
+            clip_rul = True
+            rul_cap = int(custom_cap)
+        else:
+            clip_rul = False
+            rul_cap = int(custom_cap)
+
+        outcome = SERVICE.run_external_test(
+            experiment_name=experiment_name,
+            data_folder=data_folder,
+            datasets=datasets,
+            clip_rul=clip_rul,
+            rul_cap=rul_cap,
+        )
+
+        external_metrics = outcome[
+            "metrics"
+        ]
+        external_predictions = outcome[
+            "predictions"
+        ]
+
+        all_metrics = dict(
+            development_metrics or {}
+        )
+        all_metrics["external_test"] = (
+            external_metrics
+        )
+
+        external_frame = pd.DataFrame(
+            [
+                {
+                    "split": "Official test",
+                    **{
+                        key: value
+                        for key, value
+                        in external_metrics.items()
+                        if key in {
+                            "MAE",
+                            "RMSE",
+                            "R2",
+                            "MAPE",
+                            "Bias",
+                            "motor_count",
+                            "evaluation_method",
+                        }
+                    },
+                }
+            ]
+        )
+
+        validation_predictions = (
+            pd.DataFrame(
+                validation_prediction_records
+            )
+            if validation_prediction_records
+            else None
+        )
+
+        combined_residual_figure = go.Figure()
+
+        if (
+            validation_predictions is not None
+            and not validation_predictions.empty
+        ):
+            if (
+                "residual"
+                not in validation_predictions.columns
+                and {
+                    "actual",
+                    "predicted",
+                }.issubset(
+                    validation_predictions.columns
+                )
+            ):
+                validation_predictions[
+                    "residual"
+                ] = (
+                    validation_predictions[
+                        "actual"
+                    ]
+                    - validation_predictions[
+                        "predicted"
+                    ]
+                )
+
+            if {
+                "predicted",
+                "residual",
+            }.issubset(
+                validation_predictions.columns
+            ):
+                combined_residual_figure.add_trace(
+                    go.Scatter(
+                        x=validation_predictions[
+                            "predicted"
+                        ],
+                        y=validation_predictions[
+                            "residual"
+                        ],
+                        mode="markers",
+                        name="Validation",
+                        opacity=0.35,
+                    )
+                )
+
+        if (
+            isinstance(
+                external_predictions,
+                pd.DataFrame,
+            )
+            and not external_predictions.empty
+        ):
+            predicted_column = (
+                "predicted"
+                if "predicted"
+                in external_predictions.columns
+                else "predicted_RUL"
+            )
+
+            combined_residual_figure.add_trace(
+                go.Scatter(
+                    x=external_predictions[
+                        predicted_column
+                    ],
+                    y=external_predictions[
+                        "residual"
+                    ],
+                    mode="markers",
+                    name="Official test",
+                    opacity=0.7,
+                )
+            )
+
+        combined_residual_figure.add_hline(
+            y=0,
+            line_dash="dash",
+        )
+        combined_residual_figure.update_layout(
+            title=(
+                "Validation vs official test residuals"
+            ),
+            xaxis_title="Predicted RUL",
+            yaxis_title="Actual - predicted",
+        )
+
+        status = dbc.Alert(
+            (
+                f"Official test completed for '{experiment_name}' "
+                f"using {', '.join(datasets)}. Results were added "
+                "to the saved experiment."
+            ),
+            color="success",
+        )
+
+        return (
+            status,
+            format_metric(
+                external_metrics.get("MAE")
+            ),
+            format_metric(
+                external_metrics.get("RMSE")
+            ),
+            format_metric(
+                external_metrics.get("R2")
+            ),
+            format_metric(
+                external_metrics.get("Bias")
+            ),
+            external_frame.to_dict(
+                "records"
+            ),
+            [
+                {
+                    "name": column,
+                    "id": column,
+                }
+                for column in external_frame.columns
+            ],
+            metric_comparison_figure(
+                all_metrics,
+                "RMSE",
+            ),
+            prediction_figure(
+                external_predictions,
+                "Official test: actual vs predicted RUL",
+            ),
+            residual_figure(
+                external_predictions,
+                "Official test residuals",
+            ),
+            error_distribution_figure(
+                external_predictions,
+                "Official test error distribution",
+            ),
+            combined_residual_figure,
+            all_metrics,
+        )
+
+    except Exception as exc:
+        trace = traceback.format_exc()
+
+        return (
+            dbc.Alert(
+                [
+                    html.Strong(
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    html.Details(
+                        [
+                            html.Summary(
+                                "Show traceback"
+                            ),
+                            html.Pre(
+                                trace,
+                                className="traceback",
+                            ),
+                        ]
+                    ),
+                ],
+                color="danger",
+            ),
+            "—",
+            "—",
+            "—",
+            "—",
+            [],
+            [],
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+            no_update,
+        )
+
+
+# =====================================================================
+# Data preview callback
+# =====================================================================
+
+@callback(
+    Output(
+        "data-table",
+        "data",
+    ),
+    Output(
+        "data-table",
+        "columns",
+    ),
+    Output(
+        "rul-distribution",
+        "figure",
+    ),
+    Output(
+        "motor-length-graph",
+        "figure",
+    ),
+    Output(
+        "preview-status",
+        "children",
+    ),
+    Input(
+        "preview-data",
+        "n_clicks",
+    ),
+    State(
+        "data-folder",
+        "value",
+    ),
+    State(
+        "datasets",
+        "value",
+    ),
+    State(
+        "remove-nulls",
+        "value",
+    ),
+    State(
+        "clip-rul",
+        "value",
+    ),
+    State(
+        "rul-cap",
+        "value",
+    ),
+    prevent_initial_call=True,
+    running=[
+        (
+            Output(
+                "preview-data",
+                "disabled",
+            ),
+            True,
+            False,
+        ),
+        (
+            Output(
+                "preview-data",
+                "children",
+            ),
+            "Loading…",
+            "Preview training data",
+        ),
     ],
 )
 def preview_data(
@@ -819,8 +2492,15 @@ def preview_data(
         raise PreventUpdate
 
     if IMPORT_ERROR:
-        return [], [], go.Figure(), go.Figure(), dbc.Alert(
-            IMPORT_ERROR, color="danger"
+        return (
+            [],
+            [],
+            empty_figure("RUL distribution"),
+            empty_figure("Motor lengths"),
+            dbc.Alert(
+                IMPORT_ERROR,
+                color="danger",
+            ),
         )
 
     try:
@@ -833,148 +2513,560 @@ def preview_data(
         )
 
         preview = frame.head(500)
-        columns = [{"name": col, "id": col} for col in preview.columns]
 
-        rul_fig = px.histogram(
+        columns = [
+            {
+                "name": column,
+                "id": column,
+            }
+            for column in preview.columns
+        ]
+
+        rul_figure = px.histogram(
             frame,
             x="RUL",
             nbins=50,
-            title="RUL distribution",
+            title="Training RUL distribution",
         )
 
         lengths = (
-            frame.groupby("unique_motor_id")
+            frame.groupby(
+                "unique_motor_id"
+            )
             .size()
             .rename("cycles")
             .reset_index()
-            .sort_values("cycles", ascending=False)
         )
-        motor_fig = px.histogram(
+
+        motor_figure = px.histogram(
             lengths,
             x="cycles",
             nbins=40,
-            title="Distribution of motor history lengths",
+            title=(
+                "Distribution of training motor history lengths"
+            ),
         )
 
         status = dbc.Alert(
-            f"Loaded {len(frame):,} rows and "
-            f"{frame['unique_motor_id'].nunique():,} motors.",
+            (
+                f"Loaded {len(frame):,} rows and "
+                f"{frame['unique_motor_id'].nunique():,} motors."
+            ),
             color="success",
         )
+
         return (
             preview.to_dict("records"),
             columns,
-            rul_fig,
-            motor_fig,
+            rul_figure,
+            motor_figure,
             status,
         )
+
     except Exception as exc:
-        return [], [], go.Figure(), go.Figure(), dbc.Alert(
-            f"{type(exc).__name__}: {exc}", color="danger"
+        return (
+            [],
+            [],
+            empty_figure("RUL distribution"),
+            empty_figure("Motor lengths"),
+            dbc.Alert(
+                f"{type(exc).__name__}: {exc}",
+                color="danger",
+            ),
         )
 
 
-# ---------------------------------------------------------------------
-# Saved experiment callbacks
-# ---------------------------------------------------------------------
+# =====================================================================
+# Saved experiments callbacks
+# =====================================================================
 
 @callback(
-    Output("saved-experiment-selector", "options"),
-    Output("comparison-table", "data"),
-    Output("comparison-table", "columns"),
-    Output("comparison-graph", "figure"),
-    Input("refresh-experiments", "n_clicks"),
-    Input("latest-experiment-name", "data"),
+    Output(
+        "saved-experiment-selector",
+        "options",
+    ),
+    Output(
+        "comparison-table",
+        "data",
+    ),
+    Output(
+        "comparison-table",
+        "columns",
+    ),
+    Output(
+        "comparison-graph",
+        "figure",
+    ),
+    Input(
+        "refresh-experiments",
+        "n_clicks",
+    ),
+    Input(
+        "latest-experiment-name",
+        "data",
+    ),
 )
-def refresh_experiments(_n_clicks, _latest):
+def refresh_experiments(
+    _n_clicks,
+    _latest,
+):
     if IMPORT_ERROR:
-        return [], [], [], go.Figure()
+        return (
+            [],
+            [],
+            [],
+            empty_figure(
+                "Experiment comparison"
+            ),
+        )
 
     comparison = SERVICE.list_experiments()
+
     if comparison.empty:
-        return [], [], [], go.Figure()
+        return (
+            [],
+            [],
+            [],
+            empty_figure(
+                "Experiment comparison"
+            ),
+        )
 
     options = [
-        {"label": name, "value": name}
-        for name in comparison["experiment_name"].tolist()
+        {
+            "label": name,
+            "value": name,
+        }
+        for name in comparison[
+            "experiment_name"
+        ].tolist()
     ]
 
-    figure = SERVICE.comparison_figure(comparison)
+    metric_column = (
+        "validation_RMSE"
+        if "validation_RMSE"
+        in comparison.columns
+        else "external_test_RMSE"
+        if "external_test_RMSE"
+        in comparison.columns
+        else None
+    )
+
+    if metric_column is None:
+        figure = empty_figure(
+            "Experiment comparison"
+        )
+    else:
+        figure = px.bar(
+            comparison.dropna(
+                subset=[metric_column]
+            ),
+            x="experiment_name",
+            y=metric_column,
+            color=(
+                "model_type"
+                if "model_type"
+                in comparison.columns
+                else None
+            ),
+            title=(
+                f"Saved experiments by {metric_column}"
+            ),
+        )
+
     return (
         options,
         comparison.to_dict("records"),
-        [{"name": col, "id": col} for col in comparison.columns],
+        [
+            {
+                "name": column,
+                "id": column,
+            }
+            for column in comparison.columns
+        ],
         figure,
     )
 
 
 @callback(
-    Output("comparison-table", "data", allow_duplicate=True),
-    Output("comparison-table", "columns", allow_duplicate=True),
-    Output("comparison-graph", "figure", allow_duplicate=True),
-    Input("saved-experiment-selector", "value"),
+    Output(
+        "comparison-table",
+        "data",
+        allow_duplicate=True,
+    ),
+    Output(
+        "comparison-table",
+        "columns",
+        allow_duplicate=True,
+    ),
+    Output(
+        "comparison-graph",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Input(
+        "saved-experiment-selector",
+        "value",
+    ),
     prevent_initial_call=True,
 )
-def compare_selected(experiment_names: list[str] | None):
+def compare_selected(
+    experiment_names: list[str] | None,
+):
     if not experiment_names:
         raise PreventUpdate
 
-    comparison = SERVICE.compare_experiments(experiment_names)
+    comparison = SERVICE.compare_experiments(
+        experiment_names
+    )
+
+    metric_column = (
+        "validation_RMSE"
+        if "validation_RMSE"
+        in comparison.columns
+        else "external_test_RMSE"
+        if "external_test_RMSE"
+        in comparison.columns
+        else None
+    )
+
+    if metric_column is None:
+        figure = empty_figure(
+            "Experiment comparison"
+        )
+    else:
+        figure = px.bar(
+            comparison.dropna(
+                subset=[metric_column]
+            ),
+            x="experiment_name",
+            y=metric_column,
+            color=(
+                "model_type"
+                if "model_type"
+                in comparison.columns
+                else None
+            ),
+            title=(
+                f"Selected experiments by {metric_column}"
+            ),
+        )
+
     return (
         comparison.to_dict("records"),
-        [{"name": col, "id": col} for col in comparison.columns],
-        SERVICE.comparison_figure(comparison),
+        [
+            {
+                "name": column,
+                "id": column,
+            }
+            for column in comparison.columns
+        ],
+        figure,
     )
 
 
 @callback(
-    Output("load-status", "children"),
-    Output("metric-mae", "children", allow_duplicate=True),
-    Output("metric-rmse", "children", allow_duplicate=True),
-    Output("metric-r2", "children", allow_duplicate=True),
-    Output("metric-bias", "children", allow_duplicate=True),
-    Output("metrics-table", "data", allow_duplicate=True),
-    Output("metrics-table", "columns", allow_duplicate=True),
-    Output("prediction-graph", "figure", allow_duplicate=True),
-    Output("residual-graph", "figure", allow_duplicate=True),
-    Output("error-distribution", "figure", allow_duplicate=True),
-    Output("history-graph", "figure", allow_duplicate=True),
-    Input("load-experiment", "n_clicks"),
-    State("saved-experiment-selector", "value"),
+    Output(
+        "load-status",
+        "children",
+    ),
+    Output(
+        "latest-experiment-name",
+        "data",
+        allow_duplicate=True,
+    ),
+    Output(
+        "latest-development-metrics",
+        "data",
+        allow_duplicate=True,
+    ),
+    Output(
+        "latest-validation-predictions",
+        "data",
+        allow_duplicate=True,
+    ),
+    Output(
+        "train-mae",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "validation-mae",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "train-rmse",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "validation-rmse",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "external-mae",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "external-rmse",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "external-r2",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "external-bias",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "development-metrics-table",
+        "data",
+        allow_duplicate=True,
+    ),
+    Output(
+        "development-metrics-table",
+        "columns",
+        allow_duplicate=True,
+    ),
+    Output(
+        "external-metrics-table",
+        "data",
+        allow_duplicate=True,
+    ),
+    Output(
+        "external-metrics-table",
+        "columns",
+        allow_duplicate=True,
+    ),
+    Output(
+        "development-metric-comparison",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Output(
+        "all-splits-metric-comparison",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Output(
+        "history-graph",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Output(
+        "validation-prediction-graph",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Output(
+        "validation-residual-graph",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Output(
+        "external-prediction-graph",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Output(
+        "external-residual-graph",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Input(
+        "load-experiment",
+        "n_clicks",
+    ),
+    State(
+        "saved-experiment-selector",
+        "value",
+    ),
     prevent_initial_call=True,
 )
-def load_saved_experiment(n_clicks: int, selected: list[str] | None):
+def load_saved_experiment(
+    n_clicks: int,
+    selected: list[str] | None,
+):
     if not n_clicks or not selected:
         raise PreventUpdate
 
-    # Load the first selected experiment into the result views.
     try:
-        loaded = SERVICE.load_saved(selected[0])
+        loaded = SERVICE.load_saved(
+            selected[0]
+        )
+
         metrics = loaded["metrics"]
-        predictions = loaded["predictions"]
+        train_predictions = loaded.get(
+            "train_predictions"
+        )
+        validation_predictions = loaded.get(
+            "validation_predictions"
+        )
+        external_predictions = loaded.get(
+            "external_test_predictions"
+        )
         history = loaded.get("history")
 
-        selected_metrics = SERVICE.select_primary_metrics(metrics)
-        metric_df = SERVICE.metrics_to_dataframe(metrics)
+        train_values = split_metrics(
+            metrics,
+            "train",
+        )
+        validation_values = split_metrics(
+            metrics,
+            "validation",
+        )
+        external_values = split_metrics(
+            metrics,
+            "external_test",
+        )
+
+        development_frame = metrics_dataframe(
+            {
+                "train": train_values,
+                "validation": validation_values,
+            }
+        )
+
+        external_frame = metrics_dataframe(
+            {
+                "external_test": external_values,
+            }
+        )
+
+        validation_records = (
+            validation_predictions.to_dict(
+                "records"
+            )
+            if isinstance(
+                validation_predictions,
+                pd.DataFrame,
+            )
+            else None
+        )
 
         return (
-            dbc.Alert(f"Loaded '{selected[0]}'.", color="success"),
-            SERVICE.format_metric(selected_metrics.get("MAE")),
-            SERVICE.format_metric(selected_metrics.get("RMSE")),
-            SERVICE.format_metric(selected_metrics.get("R2")),
-            SERVICE.format_metric(selected_metrics.get("Bias")),
-            metric_df.to_dict("records"),
-            [{"name": col, "id": col} for col in metric_df.columns],
-            SERVICE.prediction_figure(predictions),
-            SERVICE.residual_figure(predictions),
-            SERVICE.error_distribution_figure(predictions),
-            SERVICE.history_figure(history),
+            dbc.Alert(
+                f"Loaded '{selected[0]}'.",
+                color="success",
+            ),
+            selected[0],
+            metrics,
+            validation_records,
+            format_metric(
+                train_values.get("MAE")
+            ),
+            format_metric(
+                validation_values.get("MAE")
+            ),
+            format_metric(
+                train_values.get("RMSE")
+            ),
+            format_metric(
+                validation_values.get("RMSE")
+            ),
+            format_metric(
+                external_values.get("MAE")
+            ),
+            format_metric(
+                external_values.get("RMSE")
+            ),
+            format_metric(
+                external_values.get("R2")
+            ),
+            format_metric(
+                external_values.get("Bias")
+            ),
+            development_frame.to_dict(
+                "records"
+            ),
+            [
+                {
+                    "name": column,
+                    "id": column,
+                }
+                for column
+                in development_frame.columns
+            ],
+            external_frame.to_dict(
+                "records"
+            ),
+            [
+                {
+                    "name": column,
+                    "id": column,
+                }
+                for column
+                in external_frame.columns
+            ],
+            metric_comparison_figure(
+                {
+                    "train": train_values,
+                    "validation": validation_values,
+                },
+                "RMSE",
+            ),
+            metric_comparison_figure(
+                metrics,
+                "RMSE",
+            ),
+            history_figure(history),
+            prediction_figure(
+                validation_predictions,
+                "Validation: actual vs predicted RUL",
+            ),
+            residual_figure(
+                validation_predictions,
+                "Validation residuals",
+            ),
+            prediction_figure(
+                external_predictions,
+                "Official test: actual vs predicted RUL",
+            ),
+            residual_figure(
+                external_predictions,
+                "Official test residuals",
+            ),
         )
+
     except Exception as exc:
-        empty = go.Figure()
+        empty = empty_figure(
+            "No results available"
+        )
+
         return (
-            dbc.Alert(f"{type(exc).__name__}: {exc}", color="danger"),
-            "—", "—", "—", "—", [], [], empty, empty, empty, empty,
+            dbc.Alert(
+                f"{type(exc).__name__}: {exc}",
+                color="danger",
+            ),
+            no_update,
+            no_update,
+            no_update,
+            "—",
+            "—",
+            "—",
+            "—",
+            "—",
+            "—",
+            "—",
+            "—",
+            [],
+            [],
+            [],
+            [],
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
+            empty,
         )
 
 

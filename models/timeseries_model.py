@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Optional, Sequence
+from pathlib import Path
+from typing import Any, Optional, Sequence, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -25,62 +26,60 @@ class SequenceRULModel:
     """
     Train sequence-based regression models for Remaining Useful Life prediction.
 
-    This class is designed for datasets containing multiple independent time
-    series, such as the NASA C-MAPSS turbofan dataset.
+    Development workflow
+    --------------------
+    The DataFrame passed to this class must come from the C-MAPSS training files.
 
-    Each motor is treated as one independent time series. Complete motors are
-    assigned to train, validation, or test sets before windows are generated.
-    This prevents overlapping cycles from the same motor from leaking across
-    datasets.
+    Complete motors from those training files are divided into:
+
+        1. Training motors
+        2. Validation motors
+
+    The validation motors are used during model development for:
+
+        - early stopping
+        - learning-rate reduction
+        - hyperparameter selection
+        - overfitting analysis
+        - model comparison
+
+    The official C-MAPSS test files are not used during training. They are
+    evaluated afterward with:
+
+        test_FD00X.txt
+        RUL_FD00X.txt
+
+    The official RUL value represents the remaining useful life at the final
+    observed cycle of each test motor. For sequence models, the standard final
+    evaluation uses the last valid sequence window from every test motor.
 
     Supported window types
     ----------------------
     sliding:
-        Uses a fixed number of cycles.
+        Fixed-length windows.
 
         Example with window_size=4:
 
-            cycles 1-4 -> predict target
-            cycles 2-5 -> predict target
-            cycles 3-6 -> predict target
+            cycles 1-4 -> predict RUL at cycle 4
+            cycles 2-5 -> predict RUL at cycle 5
+            cycles 3-6 -> predict RUL at cycle 6
 
     growing:
-        Uses all available history up to the current cycle, starting from
-        min_window_size.
+        Uses the available history up to the current cycle, starting at
+        min_window_size. The sequence is left-padded to max_window_size.
 
         Example with min_window_size=3:
 
-            cycles 1-3   -> predict target
-            cycles 1-4   -> predict target
-            cycles 1-5   -> predict target
+            cycles 1-3 -> predict RUL at cycle 3
+            cycles 1-4 -> predict RUL at cycle 4
+            cycles 1-5 -> predict RUL at cycle 5
 
-        Since neural networks require equal sequence dimensions, growing
-        windows are left-padded to max_window_size.
-
-    Supported models
-    ----------------
-    lstm:
-        Stacked Long Short-Term Memory network.
-
-    gru:
-        Stacked Gated Recurrent Unit network.
-
-    cnn:
-        One-dimensional convolutional network.
-
-    cnn_lstm:
-        Convolutional feature extraction followed by an LSTM layer.
-
-    Important
-    ---------
-    This class creates many-to-one models:
-
-        sequence of sensor readings -> one RUL prediction
-
-    The target can represent:
-
-        - RUL at the final cycle inside the window
-        - RUL some cycles into the future using prediction_horizon
+    Supported model types
+    ---------------------
+    lstm
+    gru
+    cnn
+    cnn_lstm
     """
 
     SUPPORTED_MODELS = {
@@ -102,6 +101,17 @@ class SequenceRULModel:
         "none",
     }
 
+    CMAPSS_COLUMN_NAMES = (
+        [
+            "unit_number",
+            "cycle",
+            "setting_1",
+            "setting_2",
+            "setting_3",
+        ]
+        + [f"sensor_{i}" for i in range(1, 22)]
+    )
+
     def __init__(
         self,
         df: pd.DataFrame,
@@ -120,10 +130,8 @@ class SequenceRULModel:
         prediction_horizon: int = 0,
         padding_value: float = 0.0,
 
-        # Dataset split configuration
-        test_group_count: Optional[int] = None,
+        # Train/validation split configuration
         validation_group_count: Optional[int] = None,
-        test_group_size: float = 0.15,
         validation_group_size: float = 0.15,
         group_selection: str = "random",
         random_state: int = 42,
@@ -152,9 +160,9 @@ class SequenceRULModel:
         reduce_lr_patience: int = 5,
         reduce_lr_factor: float = 0.5,
         min_learning_rate: float = 1e-6,
+        shuffle_windows: bool = True,
         verbose: int = 1,
     ) -> None:
-
         self.df = df.copy()
 
         self.target_column = target_column
@@ -166,104 +174,85 @@ class SequenceRULModel:
             if feature_columns is not None
             else None
         )
-
         self.columns_to_drop = list(columns_to_drop or [])
 
-        # Window configuration
         self.window_type = window_type.lower()
-        self.window_size = window_size
-        self.min_window_size = min_window_size
+        self.window_size = int(window_size)
+        self.min_window_size = int(min_window_size)
         self.max_window_size = (
-            max_window_size
+            int(max_window_size)
             if max_window_size is not None
-            else window_size
+            else int(window_size)
         )
-        self.stride = stride
-        self.prediction_horizon = prediction_horizon
-        self.padding_value = padding_value
+        self.stride = int(stride)
+        self.prediction_horizon = int(prediction_horizon)
+        self.padding_value = float(padding_value)
 
-        # Split configuration
-        self.test_group_count = test_group_count
         self.validation_group_count = validation_group_count
-        self.test_group_size = test_group_size
-        self.validation_group_size = validation_group_size
+        self.validation_group_size = float(validation_group_size)
         self.group_selection = group_selection.lower()
-        self.random_state = random_state
+        self.random_state = int(random_state)
 
-        # Scaling configuration
         self.scaler_name = scaler.lower()
         self.scaler = None
 
-        # Model configuration
         self.model_type = model_type.lower()
         self.recurrent_units = list(recurrent_units)
         self.dense_units = list(dense_units)
         self.cnn_filters = list(cnn_filters)
-        self.kernel_size = kernel_size
-        self.pool_size = pool_size
-        self.dropout = dropout
-        self.recurrent_dropout = recurrent_dropout
-        self.bidirectional = bidirectional
+        self.kernel_size = int(kernel_size)
+        self.pool_size = int(pool_size)
+        self.dropout = float(dropout)
+        self.recurrent_dropout = float(recurrent_dropout)
+        self.bidirectional = bool(bidirectional)
 
-        # Training configuration
-        self.learning_rate = learning_rate
+        self.learning_rate = float(learning_rate)
         self.loss = loss
-        self.batch_size = batch_size
-        self.epochs = epochs
-        self.patience = patience
-        self.reduce_lr = reduce_lr
-        self.reduce_lr_patience = reduce_lr_patience
-        self.reduce_lr_factor = reduce_lr_factor
-        self.min_learning_rate = min_learning_rate
-        self.verbose = verbose
+        self.batch_size = int(batch_size)
+        self.epochs = int(epochs)
+        self.patience = int(patience)
+        self.reduce_lr = bool(reduce_lr)
+        self.reduce_lr_patience = int(reduce_lr_patience)
+        self.reduce_lr_factor = float(reduce_lr_factor)
+        self.min_learning_rate = float(min_learning_rate)
+        self.shuffle_windows = bool(shuffle_windows)
+        self.verbose = int(verbose)
 
-        # Group identifiers
-        self.train_group_ids = None
-        self.validation_group_ids = None
-        self.test_group_ids = None
+        # Development split
+        self.train_group_ids: Optional[np.ndarray] = None
+        self.validation_group_ids: Optional[np.ndarray] = None
 
-        # Row-level split DataFrames
-        self.train_df = None
-        self.validation_df = None
-        self.test_df = None
+        self.train_df: Optional[pd.DataFrame] = None
+        self.validation_df: Optional[pd.DataFrame] = None
 
-        # Sequence arrays
-        self.X_train = None
-        self.X_validation = None
-        self.X_test = None
+        self.X_train: Optional[np.ndarray] = None
+        self.X_validation: Optional[np.ndarray] = None
+        self.y_train: Optional[np.ndarray] = None
+        self.y_validation: Optional[np.ndarray] = None
 
-        self.y_train = None
-        self.y_validation = None
-        self.y_test = None
+        self.train_metadata: Optional[pd.DataFrame] = None
+        self.validation_metadata: Optional[pd.DataFrame] = None
 
-        # Metadata links each generated window to its motor and cycle.
-        self.train_metadata = None
-        self.validation_metadata = None
-        self.test_metadata = None
-
-        # TensorFlow model and history
-        self.model = None
+        self.model: Optional[keras.Model] = None
         self.history = None
 
-        # Predictions
-        self.y_train_pred = None
-        self.y_validation_pred = None
-        self.y_test_pred = None
+        self.y_train_pred: Optional[np.ndarray] = None
+        self.y_validation_pred: Optional[np.ndarray] = None
 
-        # Metrics
-        self.train_metrics = None
-        self.validation_metrics = None
-        self.test_metrics = None
+        self.train_metrics: Optional[dict[str, float]] = None
+        self.validation_metrics: Optional[dict[str, float]] = None
+
+        # Official external test results
+        self.external_test_results: Optional[pd.DataFrame] = None
+        self.external_test_metrics: Optional[dict[str, Any]] = None
 
         self._validate_configuration()
 
     # ==========================================================
-    # Configuration validation
+    # Validation and feature selection
     # ==========================================================
 
     def _validate_configuration(self) -> None:
-        """Validate columns and constructor parameters."""
-
         required_columns = {
             self.target_column,
             self.group_column,
@@ -271,7 +260,6 @@ class SequenceRULModel:
         }
 
         missing = required_columns.difference(self.df.columns)
-
         if missing:
             raise ValueError(
                 f"Missing required columns: {sorted(missing)}"
@@ -295,24 +283,16 @@ class SequenceRULModel:
                 f"Available values: {sorted(self.SUPPORTED_SCALERS)}"
             )
 
-        if self.group_selection not in {
-            "random",
-            "first",
-            "last",
-        }:
+        if self.group_selection not in {"random", "first", "last"}:
             raise ValueError(
                 "group_selection must be 'random', 'first', or 'last'."
             )
 
         if self.window_size < 2:
-            raise ValueError(
-                "window_size must be at least 2."
-            )
+            raise ValueError("window_size must be at least 2.")
 
         if self.min_window_size < 2:
-            raise ValueError(
-                "min_window_size must be at least 2."
-            )
+            raise ValueError("min_window_size must be at least 2.")
 
         if self.max_window_size < self.min_window_size:
             raise ValueError(
@@ -320,54 +300,46 @@ class SequenceRULModel:
             )
 
         if self.stride < 1:
-            raise ValueError(
-                "stride must be at least 1."
-            )
+            raise ValueError("stride must be at least 1.")
 
         if self.prediction_horizon < 0:
             raise ValueError(
                 "prediction_horizon cannot be negative."
             )
 
-        if not 0 <= self.dropout < 1:
+        if not 0 < self.validation_group_size < 1:
             raise ValueError(
-                "dropout must be between 0 and 1."
+                "validation_group_size must be between 0 and 1."
             )
+
+        if (
+            self.validation_group_count is not None
+            and self.validation_group_count <= 0
+        ):
+            raise ValueError(
+                "validation_group_count must be greater than zero."
+            )
+
+        if not 0 <= self.dropout < 1:
+            raise ValueError("dropout must be between 0 and 1.")
 
         if self.df[self.target_column].isna().any():
             raise ValueError(
                 f"Target column '{self.target_column}' contains null values."
             )
 
-    # ==========================================================
-    # Feature selection
-    # ==========================================================
-
-    def _resolve_feature_columns(self) -> list[str]:
-        """
-        Determine the columns used as sequence input features.
-
-        If feature_columns was explicitly supplied, those columns are used.
-
-        Otherwise, every numeric column is used except:
-            - target column
-            - group identifier
-            - columns_to_drop
-
-        The time column remains available by default. Add it to
-        columns_to_drop if cycle should not be a model feature.
-        """
+    def _resolve_feature_columns(
+        self,
+        frame: Optional[pd.DataFrame] = None,
+    ) -> list[str]:
+        source = self.df if frame is None else frame
 
         if self.feature_columns is not None:
-            missing = set(self.feature_columns).difference(
-                self.df.columns
-            )
-
+            missing = set(self.feature_columns).difference(source.columns)
             if missing:
                 raise ValueError(
                     f"Missing feature columns: {sorted(missing)}"
                 )
-
             return self.feature_columns.copy()
 
         excluded = {
@@ -378,32 +350,25 @@ class SequenceRULModel:
 
         columns = [
             column
-            for column in self.df.select_dtypes(
-                include=np.number
-            ).columns
+            for column in source.select_dtypes(include=np.number).columns
             if column not in excluded
         ]
 
         if not columns:
-            raise ValueError(
-                "No numeric feature columns are available."
-            )
+            raise ValueError("No numeric feature columns are available.")
 
         return columns
 
     # ==========================================================
-    # Group-aware splitting
+    # Train/validation split by complete motors
     # ==========================================================
 
     def split_groups(self) -> None:
         """
-        Divide complete motors into train, validation, and test sets.
+        Split complete motors from the training files into train and validation.
 
-        Motors are split before sequence windows are generated. This is
-        essential because overlapping windows from the same motor must never
-        appear in multiple datasets.
+        No observations from a validation motor can appear in training.
         """
-
         data = self.df.sort_values(
             [self.group_column, self.time_column]
         ).copy()
@@ -416,106 +381,62 @@ class SequenceRULModel:
 
         total_groups = len(group_ids)
 
-        if total_groups < 3:
+        if total_groups < 2:
             raise ValueError(
-                "At least three complete groups are required for "
-                "train, validation, and test splitting."
+                "At least two complete motors are required."
             )
-
-        if self.test_group_count is not None:
-            test_count = self.test_group_count
-        else:
-            test_count = max(
-                1,
-                int(np.ceil(total_groups * self.test_group_size)),
-            )
-
-        remaining_after_test = total_groups - test_count
 
         if self.validation_group_count is not None:
-            validation_count = self.validation_group_count
+            validation_count = int(self.validation_group_count)
         else:
             validation_count = max(
                 1,
-                int(
-                    np.ceil(
-                        total_groups
-                        * self.validation_group_size
-                    )
-                ),
+                int(np.ceil(total_groups * self.validation_group_size)),
             )
 
-        if test_count + validation_count >= total_groups:
+        if validation_count >= total_groups:
             raise ValueError(
-                "The combined validation and test group counts must be "
-                "smaller than the total number of groups."
+                "The number of validation motors must be smaller than "
+                "the total number of motors."
             )
 
         if self.group_selection == "random":
-            rng = np.random.default_rng(
-                self.random_state
-            )
-
-            shuffled_groups = rng.permutation(
-                group_ids
-            )
+            rng = np.random.default_rng(self.random_state)
+            ordered_groups = rng.permutation(group_ids)
+            self.validation_group_ids = ordered_groups[-validation_count:]
+            self.train_group_ids = ordered_groups[:-validation_count]
 
         elif self.group_selection == "last":
-            shuffled_groups = group_ids
+            self.validation_group_ids = group_ids[-validation_count:]
+            self.train_group_ids = group_ids[:-validation_count]
 
         else:
-            # For "first", reverse the order so the first groups are
-            # selected for test and validation.
-            shuffled_groups = group_ids[::-1]
+            self.validation_group_ids = group_ids[:validation_count]
+            self.train_group_ids = group_ids[validation_count:]
 
-        if self.group_selection in {"random", "last"}:
-            self.test_group_ids = shuffled_groups[-test_count:]
-
-            self.validation_group_ids = shuffled_groups[
-                -(test_count + validation_count):-test_count
-            ]
-
-            self.train_group_ids = shuffled_groups[
-                :-(test_count + validation_count)
-            ]
-
-        else:
-            self.test_group_ids = shuffled_groups[-test_count:]
-
-            self.validation_group_ids = shuffled_groups[
-                -(test_count + validation_count):-test_count
-            ]
-
-            self.train_group_ids = shuffled_groups[
-                :-(test_count + validation_count)
-            ]
-
-        train_mask = data[self.group_column].isin(
-            self.train_group_ids
+        overlap = set(self.train_group_ids).intersection(
+            set(self.validation_group_ids)
         )
+        if overlap:
+            raise RuntimeError(
+                f"Data leakage detected. Shared motors: {sorted(overlap)}"
+            )
 
+        train_mask = data[self.group_column].isin(self.train_group_ids)
         validation_mask = data[self.group_column].isin(
             self.validation_group_ids
         )
 
-        test_mask = data[self.group_column].isin(
-            self.test_group_ids
-        )
-
         self.train_df = data.loc[train_mask].copy()
         self.validation_df = data.loc[validation_mask].copy()
-        self.test_df = data.loc[test_mask].copy()
 
         print(
-            f"Train groups: {len(self.train_group_ids)} | "
-            f"Validation groups: {len(self.validation_group_ids)} | "
-            f"Test groups: {len(self.test_group_ids)}"
+            f"Train motors: {len(self.train_group_ids)} | "
+            f"Validation motors: {len(self.validation_group_ids)}"
         )
-
         print(
             f"Train rows: {len(self.train_df):,} | "
-            f"Validation rows: {len(self.validation_df):,} | "
-            f"Test rows: {len(self.test_df):,}"
+            f"Validation rows: {len(self.validation_df):,}"
         )
 
     # ==========================================================
@@ -523,82 +444,65 @@ class SequenceRULModel:
     # ==========================================================
 
     def _create_scaler(self):
-        """Create the selected sklearn scaler."""
-
         if self.scaler_name == "standard":
             return StandardScaler()
-
         if self.scaler_name == "minmax":
             return MinMaxScaler()
-
         if self.scaler_name == "robust":
             return RobustScaler()
-
         if self.scaler_name == "none":
             return None
 
-        raise ValueError(
-            f"Unsupported scaler: {self.scaler_name}"
-        )
+        raise ValueError(f"Unsupported scaler: {self.scaler_name}")
 
     def _fit_and_apply_scaler(self) -> None:
         """
-        Fit the scaler only using training motors.
-
-        Validation and test datasets are transformed using the statistics
-        learned from training data. This prevents information leakage.
+        Fit the scaler only on training motors and transform validation motors
+        with the fitted training statistics.
         """
-
         feature_columns = self._resolve_feature_columns()
 
         self.scaler = self._create_scaler()
-
         if self.scaler is None:
             return
 
-        self.scaler.fit(
+        self.scaler.fit(self.train_df[feature_columns])
+
+        self.train_df.loc[:, feature_columns] = self.scaler.transform(
             self.train_df[feature_columns]
         )
-
-        self.train_df.loc[:, feature_columns] = (
-            self.scaler.transform(
-                self.train_df[feature_columns]
-            )
+        self.validation_df.loc[:, feature_columns] = self.scaler.transform(
+            self.validation_df[feature_columns]
         )
 
-        self.validation_df.loc[:, feature_columns] = (
-            self.scaler.transform(
-                self.validation_df[feature_columns]
-            )
-        )
+    def _transform_external_features(
+        self,
+        external_df: pd.DataFrame,
+    ) -> pd.DataFrame:
+        feature_columns = self._resolve_feature_columns(external_df)
+        transformed = external_df.copy()
 
-        self.test_df.loc[:, feature_columns] = (
-            self.scaler.transform(
-                self.test_df[feature_columns]
+        if self.scaler is not None:
+            transformed.loc[:, feature_columns] = self.scaler.transform(
+                transformed[feature_columns]
             )
-        )
+
+        return transformed
 
     # ==========================================================
     # Window generation
     # ==========================================================
+
+    def _sequence_length(self) -> int:
+        if self.window_type == "sliding":
+            return self.window_size
+        return self.max_window_size
 
     def _left_pad_window(
         self,
         values: np.ndarray,
         desired_length: int,
     ) -> np.ndarray:
-        """
-        Left-pad a growing window to a fixed sequence length.
-
-        Recent observations remain at the end of the sequence.
-
-        Example:
-            original length: 3
-            desired length: 5
-
-            [padding, padding, cycle1, cycle2, cycle3]
-        """
-
         current_length = len(values)
 
         if current_length > desired_length:
@@ -613,45 +517,24 @@ class SequenceRULModel:
         padding = np.full(
             shape=(pad_length, values.shape[1]),
             fill_value=self.padding_value,
-            dtype=float,
+            dtype=np.float32,
         )
 
-        return np.vstack(
-            [padding, values]
-        )
+        return np.vstack([padding, values])
 
     def _generate_windows(
         self,
         data: pd.DataFrame,
     ) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
         """
-        Generate sequence windows independently for each motor.
-
-        Returns
-        -------
-        X:
-            Shape:
-                number of windows,
-                sequence length,
-                number of features
-
-        y:
-            One target value per generated window.
-
-        metadata:
-            Information about each window:
-                group id
-                starting cycle
-                ending cycle
-                target cycle
-                source row index
+        Generate all valid training or validation windows independently
+        for every motor.
         """
+        feature_columns = self._resolve_feature_columns(data)
 
-        feature_columns = self._resolve_feature_columns()
-
-        X_windows = []
-        y_values = []
-        metadata_rows = []
+        X_windows: list[np.ndarray] = []
+        y_values: list[float] = []
+        metadata_rows: list[dict[str, Any]] = []
 
         grouped = data.groupby(
             self.group_column,
@@ -659,30 +542,18 @@ class SequenceRULModel:
         )
 
         for group_id, group in grouped:
-            group = group.sort_values(
-                self.time_column
-            )
+            group = group.sort_values(self.time_column)
 
-            X_group = group[
-                feature_columns
-            ].to_numpy(dtype=np.float32)
-
-            y_group = group[
-                self.target_column
-            ].to_numpy(dtype=np.float32)
-
-            cycles = group[
-                self.time_column
-            ].to_numpy()
-
+            X_group = group[feature_columns].to_numpy(dtype=np.float32)
+            y_group = group[self.target_column].to_numpy(dtype=np.float32)
+            cycles = group[self.time_column].to_numpy()
             indexes = group.index.to_numpy()
 
             sequence_length = len(group)
 
             if self.window_type == "sliding":
                 minimum_required = (
-                    self.window_size
-                    + self.prediction_horizon
+                    self.window_size + self.prediction_horizon
                 )
 
                 if sequence_length < minimum_required:
@@ -695,38 +566,29 @@ class SequenceRULModel:
                     + 1
                 )
 
-                for start in range(
-                    0,
-                    last_start,
-                    self.stride,
-                ):
+                for start in range(0, last_start, self.stride):
                     end = start + self.window_size
-
                     target_position = (
                         end - 1 + self.prediction_horizon
                     )
 
-                    X_window = X_group[start:end]
+                    X_windows.append(X_group[start:end])
+                    y_values.append(float(y_group[target_position]))
 
-                    X_windows.append(X_window)
-                    y_values.append(
-                        y_group[target_position]
+                    metadata_rows.append(
+                        {
+                            self.group_column: group_id,
+                            "window_start_cycle": cycles[start],
+                            "window_end_cycle": cycles[end - 1],
+                            "target_cycle": cycles[target_position],
+                            "target_row_index": indexes[target_position],
+                        }
                     )
 
-                    metadata_rows.append({
-                        self.group_column: group_id,
-                        "window_start_cycle": cycles[start],
-                        "window_end_cycle": cycles[end - 1],
-                        "target_cycle": cycles[target_position],
-                        "target_row_index": indexes[target_position],
-                    })
-
-            elif self.window_type == "growing":
+            else:
                 first_end = self.min_window_size
-
                 last_end = (
-                    sequence_length
-                    - self.prediction_horizon
+                    sequence_length - self.prediction_horizon
                 )
 
                 for end in range(
@@ -737,66 +599,112 @@ class SequenceRULModel:
                     target_position = (
                         end - 1 + self.prediction_horizon
                     )
+                    start = max(0, end - self.max_window_size)
+                    observed = X_group[start:end]
 
-                    start = max(
-                        0,
-                        end - self.max_window_size,
+                    X_windows.append(
+                        self._left_pad_window(
+                            observed,
+                            desired_length=self.max_window_size,
+                        )
                     )
+                    y_values.append(float(y_group[target_position]))
 
-                    growing_values = X_group[start:end]
-
-                    X_window = self._left_pad_window(
-                        growing_values,
-                        desired_length=self.max_window_size,
+                    metadata_rows.append(
+                        {
+                            self.group_column: group_id,
+                            "window_start_cycle": cycles[start],
+                            "window_end_cycle": cycles[end - 1],
+                            "target_cycle": cycles[target_position],
+                            "target_row_index": indexes[target_position],
+                            "observed_window_length": len(observed),
+                        }
                     )
-
-                    X_windows.append(X_window)
-                    y_values.append(
-                        y_group[target_position]
-                    )
-
-                    metadata_rows.append({
-                        self.group_column: group_id,
-                        "window_start_cycle": cycles[start],
-                        "window_end_cycle": cycles[end - 1],
-                        "target_cycle": cycles[target_position],
-                        "target_row_index": indexes[target_position],
-                        "observed_window_length": len(
-                            growing_values
-                        ),
-                    })
 
         if not X_windows:
             raise ValueError(
-                "No windows were created. Check window_size, "
-                "min_window_size, max_window_size, prediction_horizon, "
-                "and the lengths of the motor histories."
+                "No windows were created. Check the configured window sizes, "
+                "prediction horizon, and motor history lengths."
             )
 
         return (
-            np.asarray(
-                X_windows,
-                dtype=np.float32,
-            ),
-            np.asarray(
-                y_values,
-                dtype=np.float32,
-            ),
+            np.asarray(X_windows, dtype=np.float32),
+            np.asarray(y_values, dtype=np.float32),
+            pd.DataFrame(metadata_rows),
+        )
+
+    def _generate_final_windows(
+        self,
+        data: pd.DataFrame,
+    ) -> tuple[np.ndarray, pd.DataFrame]:
+        """
+        Generate exactly one final sequence per external test motor.
+
+        The generated sequence ends at the last observed test cycle. This is
+        the standard input used to compare predictions with RUL_FD00X.txt.
+        """
+        feature_columns = self._resolve_feature_columns(data)
+
+        X_windows: list[np.ndarray] = []
+        metadata_rows: list[dict[str, Any]] = []
+
+        for group_id, group in data.groupby(
+            self.group_column,
+            sort=False,
+        ):
+            group = group.sort_values(self.time_column)
+
+            values = group[feature_columns].to_numpy(dtype=np.float32)
+            cycles = group[self.time_column].to_numpy()
+
+            if self.window_type == "sliding":
+                if len(values) < self.window_size:
+                    continue
+
+                window = values[-self.window_size:]
+                start_cycle = cycles[-self.window_size]
+                observed_length = self.window_size
+
+            else:
+                if len(values) < self.min_window_size:
+                    continue
+
+                observed = values[-self.max_window_size:]
+                window = self._left_pad_window(
+                    observed,
+                    desired_length=self.max_window_size,
+                )
+                start_cycle = cycles[-len(observed)]
+                observed_length = len(observed)
+
+            X_windows.append(window)
+
+            metadata_rows.append(
+                {
+                    self.group_column: group_id,
+                    "window_start_cycle": start_cycle,
+                    "window_end_cycle": cycles[-1],
+                    "target_cycle": cycles[-1],
+                    "observed_window_length": observed_length,
+                }
+            )
+
+        if not X_windows:
+            raise ValueError(
+                "No final external windows were created. Some motors may be "
+                "shorter than the configured minimum window."
+            )
+
+        return (
+            np.asarray(X_windows, dtype=np.float32),
             pd.DataFrame(metadata_rows),
         )
 
     def prepare_data(self) -> None:
         """
-        Perform the complete sequence-data preparation process.
-
-        Steps
-        -----
-        1. Split complete motors.
-        2. Fit the scaler using training motors only.
-        3. Transform train, validation, and test data.
-        4. Generate sequence windows independently in each split.
+        Split training-file motors, fit scaling on training motors only, and
+        create train and validation sequence windows.
         """
-
         self.split_groups()
         self._fit_and_apply_scaler()
 
@@ -804,55 +712,32 @@ class SequenceRULModel:
             self.X_train,
             self.y_train,
             self.train_metadata,
-        ) = self._generate_windows(
-            self.train_df
-        )
+        ) = self._generate_windows(self.train_df)
 
         (
             self.X_validation,
             self.y_validation,
             self.validation_metadata,
-        ) = self._generate_windows(
-            self.validation_df
-        )
+        ) = self._generate_windows(self.validation_df)
 
-        (
-            self.X_test,
-            self.y_test,
-            self.test_metadata,
-        ) = self._generate_windows(
-            self.test_df
-        )
-
-        print(
-            "\nSequence shapes:"
-        )
-
+        print("\nSequence shapes:")
         print(
             f"X_train: {self.X_train.shape} | "
             f"y_train: {self.y_train.shape}"
         )
-
         print(
             f"X_validation: {self.X_validation.shape} | "
             f"y_validation: {self.y_validation.shape}"
         )
 
-        print(
-            f"X_test: {self.X_test.shape} | "
-            f"y_test: {self.y_test.shape}"
-        )
-
     # ==========================================================
-    # Model creation
+    # Model construction
     # ==========================================================
 
     def _add_dense_head(
         self,
         model: keras.Sequential,
     ) -> None:
-        """Add fully connected regression layers."""
-
         for units in self.dense_units:
             model.add(
                 layers.Dense(
@@ -862,36 +747,17 @@ class SequenceRULModel:
             )
 
             if self.dropout > 0:
-                model.add(
-                    layers.Dropout(
-                        self.dropout
-                    )
-                )
+                model.add(layers.Dropout(self.dropout))
 
-        model.add(
-            layers.Dense(
-                1,
-                activation="linear",
-            )
-        )
+        model.add(layers.Dense(1, activation="linear"))
 
     def _build_lstm_model(
         self,
         input_shape: tuple[int, int],
     ) -> keras.Model:
-        """Create an LSTM regression model."""
+        model = keras.Sequential(name="lstm_rul_model")
+        model.add(layers.Input(shape=input_shape))
 
-        model = keras.Sequential(
-            name="lstm_rul_model"
-        )
-
-        model.add(
-            layers.Input(
-                shape=input_shape
-            )
-        )
-
-        # Mask left-padding for growing windows.
         if self.window_type == "growing":
             model.add(
                 layers.Masking(
@@ -899,12 +765,9 @@ class SequenceRULModel:
                 )
             )
 
-        for index, units in enumerate(
-            self.recurrent_units
-        ):
+        for index, units in enumerate(self.recurrent_units):
             return_sequences = (
-                index
-                < len(self.recurrent_units) - 1
+                index < len(self.recurrent_units) - 1
             )
 
             recurrent_layer = layers.LSTM(
@@ -922,24 +785,14 @@ class SequenceRULModel:
             model.add(recurrent_layer)
 
         self._add_dense_head(model)
-
         return model
 
     def _build_gru_model(
         self,
         input_shape: tuple[int, int],
     ) -> keras.Model:
-        """Create a GRU regression model."""
-
-        model = keras.Sequential(
-            name="gru_rul_model"
-        )
-
-        model.add(
-            layers.Input(
-                shape=input_shape
-            )
-        )
+        model = keras.Sequential(name="gru_rul_model")
+        model.add(layers.Input(shape=input_shape))
 
         if self.window_type == "growing":
             model.add(
@@ -948,12 +801,9 @@ class SequenceRULModel:
                 )
             )
 
-        for index, units in enumerate(
-            self.recurrent_units
-        ):
+        for index, units in enumerate(self.recurrent_units):
             return_sequences = (
-                index
-                < len(self.recurrent_units) - 1
+                index < len(self.recurrent_units) - 1
             )
 
             recurrent_layer = layers.GRU(
@@ -971,30 +821,14 @@ class SequenceRULModel:
             model.add(recurrent_layer)
 
         self._add_dense_head(model)
-
         return model
 
     def _build_cnn_model(
         self,
         input_shape: tuple[int, int],
     ) -> keras.Model:
-        """
-        Create a one-dimensional CNN regression model.
-
-        Note:
-            CNN layers do not use Keras Masking in the same way as recurrent
-            layers. Sliding windows are generally preferable for this model.
-        """
-
-        model = keras.Sequential(
-            name="cnn_rul_model"
-        )
-
-        model.add(
-            layers.Input(
-                shape=input_shape
-            )
-        )
+        model = keras.Sequential(name="cnn_rul_model")
+        model.add(layers.Input(shape=input_shape))
 
         for filters in self.cnn_filters:
             model.add(
@@ -1005,11 +839,7 @@ class SequenceRULModel:
                     activation="relu",
                 )
             )
-
-            model.add(
-                layers.BatchNormalization()
-            )
-
+            model.add(layers.BatchNormalization())
             model.add(
                 layers.MaxPooling1D(
                     pool_size=self.pool_size,
@@ -1018,35 +848,18 @@ class SequenceRULModel:
             )
 
             if self.dropout > 0:
-                model.add(
-                    layers.Dropout(
-                        self.dropout
-                    )
-                )
+                model.add(layers.Dropout(self.dropout))
 
-        model.add(
-            layers.GlobalAveragePooling1D()
-        )
-
+        model.add(layers.GlobalAveragePooling1D())
         self._add_dense_head(model)
-
         return model
 
     def _build_cnn_lstm_model(
         self,
         input_shape: tuple[int, int],
     ) -> keras.Model:
-        """Create a CNN feature extractor followed by an LSTM."""
-
-        model = keras.Sequential(
-            name="cnn_lstm_rul_model"
-        )
-
-        model.add(
-            layers.Input(
-                shape=input_shape
-            )
-        )
+        model = keras.Sequential(name="cnn_lstm_rul_model")
+        model.add(layers.Input(shape=input_shape))
 
         for filters in self.cnn_filters:
             model.add(
@@ -1057,17 +870,10 @@ class SequenceRULModel:
                     activation="relu",
                 )
             )
-
-            model.add(
-                layers.BatchNormalization()
-            )
+            model.add(layers.BatchNormalization())
 
             if self.dropout > 0:
-                model.add(
-                    layers.Dropout(
-                        self.dropout
-                    )
-                )
+                model.add(layers.Dropout(self.dropout))
 
         lstm_units = (
             self.recurrent_units[-1]
@@ -1084,73 +890,49 @@ class SequenceRULModel:
         )
 
         self._add_dense_head(model)
-
         return model
 
     def build_model(self) -> keras.Model:
-        """
-        Build and compile the configured neural network.
-
-        prepare_data() is called automatically when sequence arrays do not
-        already exist.
-        """
-
         if self.X_train is None:
             self.prepare_data()
 
         input_shape = self.X_train.shape[1:]
 
         if self.model_type == "lstm":
-            self.model = self._build_lstm_model(
-                input_shape
-            )
-
+            self.model = self._build_lstm_model(input_shape)
         elif self.model_type == "gru":
-            self.model = self._build_gru_model(
-                input_shape
-            )
-
+            self.model = self._build_gru_model(input_shape)
         elif self.model_type == "cnn":
-            self.model = self._build_cnn_model(
-                input_shape
-            )
-
-        elif self.model_type == "cnn_lstm":
-            self.model = self._build_cnn_lstm_model(
-                input_shape
-            )
+            self.model = self._build_cnn_model(input_shape)
+        else:
+            self.model = self._build_cnn_lstm_model(input_shape)
 
         optimizer = keras.optimizers.Adam(
             learning_rate=self.learning_rate
         )
 
-        if self.loss == "huber":
-            selected_loss = keras.losses.Huber()
-        else:
-            selected_loss = self.loss
+        selected_loss = (
+            keras.losses.Huber()
+            if self.loss == "huber"
+            else self.loss
+        )
 
         self.model.compile(
             optimizer=optimizer,
             loss=selected_loss,
             metrics=[
-                keras.metrics.MeanAbsoluteError(
-                    name="mae"
-                ),
-                keras.metrics.RootMeanSquaredError(
-                    name="rmse"
-                ),
+                keras.metrics.MeanAbsoluteError(name="mae"),
+                keras.metrics.RootMeanSquaredError(name="rmse"),
             ],
         )
 
         return self.model
 
     # ==========================================================
-    # Training
+    # Training and development evaluation
     # ==========================================================
 
     def _create_callbacks(self) -> list:
-        """Create EarlyStopping and optional ReduceLROnPlateau callbacks."""
-
         callbacks = [
             keras.callbacks.EarlyStopping(
                 monitor="val_loss",
@@ -1175,14 +957,16 @@ class SequenceRULModel:
 
     def train(self) -> dict[str, dict[str, float]]:
         """
-        Prepare data, build the model, train, predict, and calculate metrics.
+        Train using training motors and monitor validation motors.
 
-        Returns
-        -------
-        dict
-            Metrics for train, validation, and test sequence windows.
+        Returns only development metrics:
+
+            train
+            validation
+
+        Official test metrics are produced separately by
+        evaluate_cmapss_final_windows().
         """
-
         if self.X_train is None:
             self.prepare_data()
 
@@ -1199,7 +983,7 @@ class SequenceRULModel:
             epochs=self.epochs,
             batch_size=self.batch_size,
             callbacks=self._create_callbacks(),
-            shuffle=True,
+            shuffle=self.shuffle_windows,
             verbose=self.verbose,
         )
 
@@ -1219,14 +1003,6 @@ class SequenceRULModel:
             .reshape(-1)
         )
 
-        self.y_test_pred = (
-            self.model.predict(
-                self.X_test,
-                verbose=0,
-            )
-            .reshape(-1)
-        )
-
         self.train_metrics = self._calculate_metrics(
             self.y_train,
             self.y_train_pred,
@@ -1237,79 +1013,66 @@ class SequenceRULModel:
             self.y_validation_pred,
         )
 
-        self.test_metrics = self._calculate_metrics(
-            self.y_test,
-            self.y_test_pred,
-        )
-
         return self.get_metrics()
-
-    # ==========================================================
-    # Metrics and results
-    # ==========================================================
 
     @staticmethod
     def _calculate_metrics(
-        y_true: np.ndarray,
-        y_pred: np.ndarray,
+        y_true: np.ndarray | pd.Series,
+        y_pred: np.ndarray | pd.Series,
     ) -> dict[str, float]:
-        """Calculate regression metrics."""
-
-        y_true = np.asarray(
+        y_true_array = np.asarray(
             y_true,
             dtype=float,
         ).reshape(-1)
 
-        y_pred = np.asarray(
+        y_pred_array = np.asarray(
             y_pred,
             dtype=float,
         ).reshape(-1)
 
-        residuals = y_true - y_pred
+        residuals = y_true_array - y_pred_array
 
         denominator = np.where(
-            y_true == 0,
+            y_true_array == 0,
             np.nan,
-            np.abs(y_true),
+            np.abs(y_true_array),
         )
 
         return {
             "MAE": float(
                 mean_absolute_error(
-                    y_true,
-                    y_pred,
+                    y_true_array,
+                    y_pred_array,
                 )
             ),
             "RMSE": float(
                 np.sqrt(
                     mean_squared_error(
-                        y_true,
-                        y_pred,
+                        y_true_array,
+                        y_pred_array,
                     )
                 )
             ),
             "R2": float(
                 r2_score(
-                    y_true,
-                    y_pred,
+                    y_true_array,
+                    y_pred_array,
                 )
             ),
             "MAPE": float(
                 np.nanmean(
-                    np.abs(residuals)
-                    / denominator
+                    np.abs(residuals) / denominator
                 )
                 * 100
             ),
-            "Bias": float(
-                residuals.mean()
-            ),
+            "Bias": float(residuals.mean()),
         }
 
     def get_metrics(self) -> dict[str, dict[str, float]]:
-        """Return train, validation, and test metrics."""
-
-        if self.test_metrics is None:
+        if (
+            self.train_metrics is None
+            or self.validation_metrics is None
+        ):
             raise RuntimeError(
                 "The model has not been trained."
             )
@@ -1317,67 +1080,52 @@ class SequenceRULModel:
         return {
             "train": self.train_metrics.copy(),
             "validation": self.validation_metrics.copy(),
-            "test": self.test_metrics.copy(),
         }
 
     def get_prediction_results(
         self,
-        dataset: str = "test",
+        dataset: str = "validation",
     ) -> pd.DataFrame:
         """
-        Return metadata, actual values, predictions, and residuals.
-
-        Parameters
-        ----------
-        dataset:
-            train, validation, or test
+        Return development predictions for 'train' or 'validation'.
         """
-
         dataset = dataset.lower()
 
         if dataset == "train":
-            metadata = self.train_metadata.copy()
+            metadata = self.train_metadata
             y_true = self.y_train
             y_pred = self.y_train_pred
 
         elif dataset == "validation":
-            metadata = self.validation_metadata.copy()
+            metadata = self.validation_metadata
             y_true = self.y_validation
             y_pred = self.y_validation_pred
 
-        elif dataset == "test":
-            metadata = self.test_metadata.copy()
-            y_true = self.y_test
-            y_pred = self.y_test_pred
-
         else:
             raise ValueError(
-                "dataset must be 'train', 'validation', or 'test'."
+                "dataset must be 'train' or 'validation'. "
+                "Use get_external_test_results() for the official test."
             )
 
-        if y_pred is None:
+        if metadata is None or y_pred is None:
             raise RuntimeError(
                 "The model has not been trained."
             )
 
         results = metadata.copy()
-
         results["actual"] = y_true
         results["predicted"] = y_pred
-
         results["residual"] = (
-            results["actual"]
-            - results["predicted"]
+            results["actual"] - results["predicted"]
         )
-
-        results["absolute_error"] = (
-            results["residual"].abs()
-        )
+        results["absolute_error"] = results["residual"].abs()
+        results["squared_error"] = results["residual"] ** 2
+        results["dataset_split"] = dataset
 
         return results
 
     # ==========================================================
-    # External sequence prediction
+    # General external DataFrame prediction
     # ==========================================================
 
     def prepare_external_data(
@@ -1390,37 +1138,15 @@ class SequenceRULModel:
         pd.DataFrame,
     ]:
         """
-        Prepare an external DataFrame using the already-fitted scaler and the
-        same window configuration.
-
-        The external DataFrame must contain the same input feature columns.
-
-        Parameters
-        ----------
-        external_df:
-            New motor histories not used during training.
-
-        target_available:
-            True when the external DataFrame contains the real target column.
-
-        Returns
-        -------
-        X_external:
-            Sequence windows.
-
-        y_external:
-            Target values, or None when target_available=False.
-
-        metadata:
-            Window-to-motor metadata.
+        Prepare any external DataFrame using the fitted scaler and the same
+        window configuration.
         """
-
         if self.model is None:
             raise RuntimeError(
                 "Train or build the model before external prediction."
             )
 
-        feature_columns = self._resolve_feature_columns()
+        feature_columns = self._resolve_feature_columns(external_df)
 
         required_columns = {
             self.group_column,
@@ -1429,43 +1155,28 @@ class SequenceRULModel:
         }
 
         if target_available:
-            required_columns.add(
-                self.target_column
-            )
+            required_columns.add(self.target_column)
 
         missing = required_columns.difference(
             external_df.columns
         )
-
         if missing:
             raise ValueError(
                 f"External data is missing columns: {sorted(missing)}"
             )
 
-        external_data = external_df.copy()
-
-        external_data = external_data.sort_values(
-            [self.group_column, self.time_column]
+        transformed = self._transform_external_features(
+            external_df.sort_values(
+                [self.group_column, self.time_column]
+            ).copy()
         )
 
-        if self.scaler is not None:
-            external_data.loc[:, feature_columns] = (
-                self.scaler.transform(
-                    external_data[feature_columns]
-                )
-            )
-
         if target_available:
-            return self._generate_windows(
-                external_data
-            )
+            return self._generate_windows(transformed)
 
-        # A temporary target is required because the internal window generator
-        # expects a target column. It is used only to locate target positions.
-        external_data[self.target_column] = 0.0
-
+        transformed[self.target_column] = 0.0
         X_external, _, metadata = self._generate_windows(
-            external_data
+            transformed
         )
 
         return X_external, None, metadata
@@ -1474,15 +1185,7 @@ class SequenceRULModel:
         self,
         external_df: pd.DataFrame,
     ) -> pd.DataFrame:
-        """
-        Predict RUL for external unlabeled motor histories.
-        """
-
-        (
-            X_external,
-            _,
-            metadata,
-        ) = self.prepare_external_data(
+        X_external, _, metadata = self.prepare_external_data(
             external_df,
             target_available=False,
         )
@@ -1496,7 +1199,6 @@ class SequenceRULModel:
         )
 
         results = metadata.copy()
-
         results["predicted"] = predictions
 
         return results
@@ -1505,17 +1207,11 @@ class SequenceRULModel:
         self,
         external_df: pd.DataFrame,
     ) -> tuple[pd.DataFrame, dict[str, float]]:
-        """
-        Predict and evaluate an external labeled sequence dataset.
-        """
-
-        (
-            X_external,
-            y_external,
-            metadata,
-        ) = self.prepare_external_data(
-            external_df,
-            target_available=True,
+        X_external, y_external, metadata = (
+            self.prepare_external_data(
+                external_df,
+                target_available=True,
+            )
         )
 
         predictions = (
@@ -1527,18 +1223,13 @@ class SequenceRULModel:
         )
 
         results = metadata.copy()
-
         results["actual"] = y_external
         results["predicted"] = predictions
-
         results["residual"] = (
-            results["actual"]
-            - results["predicted"]
+            results["actual"] - results["predicted"]
         )
-
-        results["absolute_error"] = (
-            results["residual"].abs()
-        )
+        results["absolute_error"] = results["residual"].abs()
+        results["squared_error"] = results["residual"] ** 2
 
         metrics = self._calculate_metrics(
             y_external,
@@ -1548,33 +1239,337 @@ class SequenceRULModel:
         return results, metrics
 
     # ==========================================================
+    # Official C-MAPSS test + RUL evaluation
+    # ==========================================================
+
+    @staticmethod
+    def _resolve_cmapss_datasets(
+        datasets: Union[int, str, Sequence[str]],
+    ) -> list[str]:
+        if isinstance(datasets, int):
+            if not 1 <= datasets <= 4:
+                raise ValueError(
+                    "When datasets is an integer, it must be between 1 and 4."
+                )
+
+            return [
+                f"FD{number:03d}"
+                for number in range(1, datasets + 1)
+            ]
+
+        if isinstance(datasets, str):
+            datasets = [datasets]
+
+        resolved: list[str] = []
+
+        for dataset in datasets:
+            normalized = dataset.upper().strip()
+
+            if normalized not in {
+                "FD001",
+                "FD002",
+                "FD003",
+                "FD004",
+            }:
+                raise ValueError(
+                    f"Invalid C-MAPSS dataset '{dataset}'."
+                )
+
+            if normalized not in resolved:
+                resolved.append(normalized)
+
+        if not resolved:
+            raise ValueError(
+                "At least one C-MAPSS dataset must be selected."
+            )
+
+        return resolved
+
+    @classmethod
+    def _load_cmapss_test_and_rul(
+        cls,
+        data_folder: str | Path,
+        datasets: Union[int, str, Sequence[str]] = 4,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        folder = Path(data_folder)
+
+        if not folder.exists():
+            raise FileNotFoundError(
+                f"The data folder does not exist: {folder}"
+            )
+
+        test_frames: list[pd.DataFrame] = []
+        rul_frames: list[pd.DataFrame] = []
+
+        for dataset_name in cls._resolve_cmapss_datasets(
+            datasets
+        ):
+            test_path = folder / f"test_{dataset_name}.txt"
+            rul_path = folder / f"RUL_{dataset_name}.txt"
+
+            if not test_path.is_file():
+                raise FileNotFoundError(
+                    f"Test file not found: {test_path}"
+                )
+
+            if not rul_path.is_file():
+                raise FileNotFoundError(
+                    f"RUL file not found: {rul_path}"
+                )
+
+            test_df = pd.read_csv(
+                test_path,
+                sep=r"\s+",
+                header=None,
+                names=cls.CMAPSS_COLUMN_NAMES,
+            )
+
+            test_df["dataset"] = dataset_name
+            test_df["unique_motor_id"] = (
+                test_df["dataset"]
+                + "_"
+                + test_df["unit_number"].astype(str)
+            )
+
+            rul_df = pd.read_csv(
+                rul_path,
+                sep=r"\s+",
+                header=None,
+                names=["official_RUL"],
+            )
+
+            rul_df["dataset"] = dataset_name
+            rul_df["unit_number"] = (
+                np.arange(len(rul_df)) + 1
+            )
+            rul_df["unique_motor_id"] = (
+                rul_df["dataset"]
+                + "_"
+                + rul_df["unit_number"].astype(str)
+            )
+
+            motor_count = test_df[
+                "unique_motor_id"
+            ].nunique()
+
+            if len(rul_df) != motor_count:
+                raise ValueError(
+                    f"{dataset_name}: test data contains {motor_count} motors, "
+                    f"but the RUL file contains {len(rul_df)} values."
+                )
+
+            test_frames.append(test_df)
+            rul_frames.append(rul_df)
+
+        return (
+            pd.concat(test_frames, ignore_index=True),
+            pd.concat(rul_frames, ignore_index=True),
+        )
+
+    def evaluate_cmapss_final_windows(
+        self,
+        data_folder: str | Path,
+        datasets: Union[int, str, Sequence[str]] = 4,
+        clip_rul: bool = False,
+        rul_clip_value: int = 125,
+        preprocess_fn: Optional[Any] = None,
+        prediction_column: str = "predicted_RUL",
+    ) -> tuple[pd.DataFrame, dict[str, Any]]:
+        """
+        Perform the standard official C-MAPSS sequence evaluation.
+
+        One final sequence is generated for every test motor and compared with
+        the corresponding value from RUL_FD00X.txt.
+
+        Parameters
+        ----------
+        data_folder:
+            Folder containing test_FD00X.txt and RUL_FD00X.txt.
+
+        datasets:
+            1, 2, 3, 4, one FD identifier, or a sequence of FD identifiers.
+
+        clip_rul:
+            Apply only when the model was trained with clipped RUL targets.
+
+        rul_clip_value:
+            RUL cap used when clip_rul=True.
+
+        preprocess_fn:
+            Optional feature-engineering function applied before scaling and
+            window generation. It must return a DataFrame.
+
+        Returns
+        -------
+        tuple
+            Official external test prediction table and metrics.
+        """
+        if self.model is None:
+            raise RuntimeError(
+                "The model must be trained before official test evaluation."
+            )
+
+        test_data, official_rul = (
+            self._load_cmapss_test_and_rul(
+                data_folder=data_folder,
+                datasets=datasets,
+            )
+        )
+
+        if preprocess_fn is not None:
+            test_data = preprocess_fn(test_data.copy())
+
+            if not isinstance(test_data, pd.DataFrame):
+                raise TypeError(
+                    "preprocess_fn must return a pandas DataFrame."
+                )
+
+        transformed_test = self._transform_external_features(
+            test_data
+        )
+
+        X_external, metadata = self._generate_final_windows(
+            transformed_test
+        )
+
+        predictions = (
+            self.model.predict(
+                X_external,
+                verbose=0,
+            )
+            .reshape(-1)
+        )
+
+        results = metadata.merge(
+            official_rul[
+                [
+                    "unique_motor_id",
+                    "dataset",
+                    "unit_number",
+                    "official_RUL",
+                ]
+            ],
+            left_on=self.group_column,
+            right_on="unique_motor_id",
+            how="left",
+            validate="one_to_one",
+        )
+
+        if self.group_column != "unique_motor_id":
+            results.drop(
+                columns=["unique_motor_id"],
+                inplace=True,
+            )
+
+        results["actual"] = results["official_RUL"]
+
+        if clip_rul:
+            results["actual"] = results["actual"].clip(
+                upper=rul_clip_value
+            )
+
+        results[prediction_column] = predictions
+        results["predicted"] = predictions
+        results["residual"] = (
+            results["actual"] - results["predicted"]
+        )
+        results["absolute_error"] = results["residual"].abs()
+        results["squared_error"] = results["residual"] ** 2
+        results["dataset_split"] = "external_test"
+
+        metrics: dict[str, Any] = self._calculate_metrics(
+            results["actual"],
+            results["predicted"],
+        )
+
+        selected_datasets = self._resolve_cmapss_datasets(
+            datasets
+        )
+
+        metrics.update(
+            {
+                "evaluation_method": "final_window",
+                "datasets": selected_datasets,
+                "motor_count": int(len(results)),
+                "clip_rul": bool(clip_rul),
+                "rul_clip_value": (
+                    int(rul_clip_value)
+                    if clip_rul
+                    else None
+                ),
+            }
+        )
+
+        self.external_test_results = results
+        self.external_test_metrics = metrics
+
+        return results.copy(), metrics.copy()
+
+    def get_external_test_results(self) -> pd.DataFrame:
+        if self.external_test_results is None:
+            raise RuntimeError(
+                "Official external test evaluation has not been executed. "
+                "Call evaluate_cmapss_final_windows() first."
+            )
+
+        return self.external_test_results.copy()
+
+    def get_all_metrics(self) -> dict[str, Any]:
+        metrics: dict[str, Any] = self.get_metrics()
+
+        if self.external_test_metrics is not None:
+            metrics["external_test"] = (
+                self.external_test_metrics.copy()
+            )
+
+        return metrics
+
+    # ==========================================================
     # Visual diagnostics
     # ==========================================================
 
-    def plot_training_history(self) -> None:
-        """Plot training and validation loss."""
+    def plot_training_history(
+        self,
+        metric: str = "loss",
+    ) -> None:
+        """
+        Plot training and validation error by epoch.
 
+        Examples:
+            metric="loss"
+            metric="mae"
+            metric="rmse"
+        """
         if self.history is None:
             raise RuntimeError(
                 "The model has not been trained."
             )
 
+        if metric not in self.history.history:
+            raise ValueError(
+                f"Metric '{metric}' is not available. "
+                f"Available values: {list(self.history.history)}"
+            )
+
+        validation_metric = f"val_{metric}"
+
         plt.figure(figsize=(8, 5))
-
         plt.plot(
-            self.history.history["loss"],
-            label="Train loss",
+            self.history.history[metric],
+            label=f"Train {metric}",
         )
 
-        plt.plot(
-            self.history.history["val_loss"],
-            label="Validation loss",
-        )
+        if validation_metric in self.history.history:
+            plt.plot(
+                self.history.history[validation_metric],
+                label=f"Validation {metric}",
+            )
 
         plt.xlabel("Epoch")
-        plt.ylabel("Loss")
+        plt.ylabel(metric.upper())
         plt.title(
-            f"Training History — {self.model_type}"
+            f"Training and Validation {metric.upper()} — "
+            f"{self.model_type}"
         )
         plt.legend()
         plt.tight_layout()
@@ -1582,38 +1577,30 @@ class SequenceRULModel:
 
     def plot_predictions(
         self,
-        dataset: str = "test",
+        dataset: str = "validation",
     ) -> None:
-        """Plot actual versus predicted RUL."""
-
-        results = self.get_prediction_results(
-            dataset
-        )
+        results = self.get_prediction_results(dataset)
 
         minimum = min(
             results["actual"].min(),
             results["predicted"].min(),
         )
-
         maximum = max(
             results["actual"].max(),
             results["predicted"].max(),
         )
 
         plt.figure(figsize=(7, 5))
-
         plt.scatter(
             results["actual"],
             results["predicted"],
             alpha=0.45,
         )
-
         plt.plot(
             [minimum, maximum],
             [minimum, maximum],
             linestyle="--",
         )
-
         plt.xlabel("Actual RUL")
         plt.ylabel("Predicted RUL")
         plt.title(
@@ -1624,27 +1611,17 @@ class SequenceRULModel:
 
     def plot_residuals(
         self,
-        dataset: str = "test",
+        dataset: str = "validation",
     ) -> None:
-        """Plot residuals against predicted values."""
-
-        results = self.get_prediction_results(
-            dataset
-        )
+        results = self.get_prediction_results(dataset)
 
         plt.figure(figsize=(8, 5))
-
         plt.scatter(
             results["predicted"],
             results["residual"],
             alpha=0.45,
         )
-
-        plt.axhline(
-            0,
-            linestyle="--",
-        )
-
+        plt.axhline(0, linestyle="--")
         plt.xlabel("Predicted RUL")
         plt.ylabel("Residual: actual - predicted")
         plt.title(
@@ -1653,71 +1630,159 @@ class SequenceRULModel:
         plt.tight_layout()
         plt.show()
 
-    def plot_train_validation_test_residuals(
-        self,
-    ) -> None:
-        """Compare residuals for all three datasets."""
-
-        train = self.get_prediction_results(
-            "train"
-        )
-
+    def plot_train_validation_residuals(self) -> None:
+        train = self.get_prediction_results("train")
         validation = self.get_prediction_results(
             "validation"
         )
 
-        test = self.get_prediction_results(
-            "test"
-        )
-
         plt.figure(figsize=(9, 6))
-
         plt.scatter(
             train["predicted"],
             train["residual"],
             alpha=0.2,
             label="Train",
         )
-
         plt.scatter(
             validation["predicted"],
             validation["residual"],
-            alpha=0.4,
+            alpha=0.5,
             label="Validation",
         )
-
-        plt.scatter(
-            test["predicted"],
-            test["residual"],
-            alpha=0.55,
-            label="Test",
-        )
-
-        plt.axhline(
-            0,
-            linestyle="--",
-        )
-
+        plt.axhline(0, linestyle="--")
         plt.xlabel("Predicted RUL")
         plt.ylabel("Residual: actual - predicted")
         plt.title(
-            f"Train vs Validation vs Test Residuals — "
+            f"Train vs Validation Residuals — {self.model_type}"
+        )
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+
+    def plot_external_test_predictions(self) -> None:
+        results = self.get_external_test_results()
+
+        minimum = min(
+            results["actual"].min(),
+            results["predicted"].min(),
+        )
+        maximum = max(
+            results["actual"].max(),
+            results["predicted"].max(),
+        )
+
+        plt.figure(figsize=(7, 5))
+        plt.scatter(
+            results["actual"],
+            results["predicted"],
+            alpha=0.6,
+        )
+        plt.plot(
+            [minimum, maximum],
+            [minimum, maximum],
+            linestyle="--",
+        )
+        plt.xlabel("Official RUL")
+        plt.ylabel("Predicted RUL")
+        plt.title(
+            f"Official C-MAPSS Test — {self.model_type}"
+        )
+        plt.tight_layout()
+        plt.show()
+
+    def plot_external_test_residuals(self) -> None:
+        results = self.get_external_test_results()
+
+        plt.figure(figsize=(8, 5))
+        plt.scatter(
+            results["predicted"],
+            results["residual"],
+            alpha=0.6,
+        )
+        plt.axhline(0, linestyle="--")
+        plt.xlabel("Predicted RUL")
+        plt.ylabel("Residual: official - predicted")
+        plt.title(
+            f"Official Test Residuals — {self.model_type}"
+        )
+        plt.tight_layout()
+        plt.show()
+
+    def plot_validation_vs_external_test_residuals(self) -> None:
+        """
+        Compare development-validation residuals with the final official test
+        residuals after evaluate_cmapss_final_windows() has been executed.
+        """
+        validation = self.get_prediction_results(
+            "validation"
+        )
+        external = self.get_external_test_results()
+
+        plt.figure(figsize=(9, 6))
+        plt.scatter(
+            validation["predicted"],
+            validation["residual"],
+            alpha=0.35,
+            label="Validation motors",
+        )
+        plt.scatter(
+            external["predicted"],
+            external["residual"],
+            alpha=0.7,
+            label="Official external test",
+        )
+        plt.axhline(0, linestyle="--")
+        plt.xlabel("Predicted RUL")
+        plt.ylabel("Residual: actual - predicted")
+        plt.title(
+            f"Validation vs Official Test Residuals — "
             f"{self.model_type}"
         )
         plt.legend()
         plt.tight_layout()
         plt.show()
 
+    def plot_error_metric_comparison(
+        self,
+        metric: str = "RMSE",
+    ) -> None:
+        """
+        Compare one scalar metric across train, validation, and official test.
+        """
+        metric = metric.upper()
+
+        if self.train_metrics is None:
+            raise RuntimeError(
+                "The model has not been trained."
+            )
+
+        labels = ["Train", "Validation"]
+        values = [
+            self.train_metrics[metric],
+            self.validation_metrics[metric],
+        ]
+
+        if self.external_test_metrics is not None:
+            labels.append("Official test")
+            values.append(
+                self.external_test_metrics[metric]
+            )
+
+        plt.figure(figsize=(7, 5))
+        plt.bar(labels, values)
+        plt.ylabel(metric)
+        plt.title(
+            f"{metric} Comparison — {self.model_type}"
+        )
+        plt.tight_layout()
+        plt.show()
+
     def plot_motor_predictions(
         self,
         group_id: Any,
-        dataset: str = "test",
+        dataset: str = "validation",
     ) -> None:
-        """Plot predictions across cycles for one motor."""
-
-        results = self.get_prediction_results(
-            dataset
-        )
+        results = self.get_prediction_results(dataset)
 
         motor_results = results[
             results[self.group_column] == group_id
@@ -1733,24 +1798,19 @@ class SequenceRULModel:
         )
 
         plt.figure(figsize=(10, 5))
-
         plt.plot(
             motor_results["target_cycle"],
             motor_results["actual"],
             label="Actual RUL",
         )
-
         plt.plot(
             motor_results["target_cycle"],
             motor_results["predicted"],
             label="Predicted RUL",
         )
-
         plt.xlabel("Cycle")
         plt.ylabel("RUL")
-        plt.title(
-            f"RUL Prediction for {group_id}"
-        )
+        plt.title(f"RUL Prediction for {group_id}")
         plt.legend()
         plt.tight_layout()
         plt.show()
