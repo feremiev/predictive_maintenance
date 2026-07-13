@@ -61,4 +61,5 @@ class OperatingConditionEncoder:
         """
         Learn the categories and encode the same dataset.
         """
+        print("")
         return self.fit(dataframe).transform(dataframe)
