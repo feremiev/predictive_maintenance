@@ -20,6 +20,7 @@ from sklearn.preprocessing import (
 
 from tensorflow import keras
 from tensorflow.keras import layers
+import tensorflow as tf
 
 from sklearn.base import clone
 
@@ -29,6 +30,64 @@ from utils.s_score_parameter import PHMMetrics
 from utils.validation_metric_callback import (
     ValidationMetricCallback,
 )
+
+
+@tf.keras.utils.register_keras_serializable(
+    package="predictive_maintenance"
+)
+def asymmetric_huber(
+    late_weight: float = 2.5,
+    delta: float = 10.0,
+):
+    """
+    Asymmetric Huber loss for Remaining Useful Life prediction.
+
+    Positive error means predicted RUL is greater than actual RUL,
+    which represents a dangerous late maintenance prediction.
+    """
+    late_weight = float(late_weight)
+    delta = float(delta)
+
+    def loss(
+        y_true: tf.Tensor,
+        y_pred: tf.Tensor,
+    ) -> tf.Tensor:
+        y_true = tf.cast(
+            y_true,
+            y_pred.dtype,
+        )
+
+        error = y_pred - y_true
+        absolute_error = tf.abs(error)
+
+        huber_error = tf.where(
+            absolute_error <= delta,
+            0.5 * tf.square(error),
+            delta * (
+                absolute_error
+                - 0.5 * delta
+            ),
+        )
+
+        error_weight = tf.where(
+            error > 0.0,
+            tf.cast(
+                late_weight,
+                y_pred.dtype,
+            ),
+            tf.cast(
+                1.0,
+                y_pred.dtype,
+            ),
+        )
+
+        return tf.reduce_mean(
+            error_weight * huber_error
+        )
+
+    loss.__name__ = "asymmetric_huber"
+    return loss
+
 
 class SequenceRULModel:
     """
@@ -161,6 +220,9 @@ class SequenceRULModel:
         # Training configuration
         learning_rate: float = 0.001,
         loss: str = "huber",
+        asymmetric_huber_late_weight: float = 2.5,
+        asymmetric_huber_delta: float = 10.0,
+        optimizer_clipnorm: Optional[float] = 1.0,
         batch_size: int = 64,
         epochs: int = 100,
         patience: int = 12,
@@ -218,7 +280,18 @@ class SequenceRULModel:
         self.bidirectional = bool(bidirectional)
 
         self.learning_rate = float(learning_rate)
-        self.loss = loss
+        self.loss = str(loss).lower()
+        self.asymmetric_huber_late_weight = float(
+            asymmetric_huber_late_weight
+        )
+        self.asymmetric_huber_delta = float(
+            asymmetric_huber_delta
+        )
+        self.optimizer_clipnorm = (
+            float(optimizer_clipnorm)
+            if optimizer_clipnorm is not None
+            else None
+        )
         self.batch_size = int(batch_size)
         self.epochs = int(epochs)
         self.patience = int(patience)
@@ -351,6 +424,38 @@ class SequenceRULModel:
 
         if not 0 <= self.dropout < 1:
             raise ValueError("dropout must be between 0 and 1.")
+
+        supported_losses = {
+            "huber",
+            "asymmetric_huber",
+            "mae",
+            "mse",
+        }
+
+        if self.loss not in supported_losses:
+            raise ValueError(
+                f"Unsupported loss '{self.loss}'. "
+                f"Available values: {sorted(supported_losses)}"
+            )
+
+        if self.asymmetric_huber_late_weight < 1.0:
+            raise ValueError(
+                "asymmetric_huber_late_weight must be at least 1.0."
+            )
+
+        if self.asymmetric_huber_delta <= 0:
+            raise ValueError(
+                "asymmetric_huber_delta must be greater than zero."
+            )
+
+        if (
+            self.optimizer_clipnorm is not None
+            and self.optimizer_clipnorm <= 0
+        ):
+            raise ValueError(
+                "optimizer_clipnorm must be greater than zero "
+                "or None."
+            )
 
         if self.df[self.target_column].isna().any():
             raise ValueError(
@@ -1132,21 +1237,51 @@ class SequenceRULModel:
             self.model = self._build_cnn_lstm_model(input_shape)
 
         optimizer = keras.optimizers.Adam(
-            learning_rate=self.learning_rate
+            learning_rate=self.learning_rate,
+            clipnorm=self.optimizer_clipnorm,
         )
 
-        selected_loss = (
-            keras.losses.Huber()
-            if self.loss == "huber"
-            else self.loss
-        )
+        if self.loss == "asymmetric_huber":
+            selected_loss = asymmetric_huber(
+                late_weight=(
+                    self.asymmetric_huber_late_weight
+                ),
+                delta=self.asymmetric_huber_delta,
+            )
+
+        elif self.loss == "huber":
+            selected_loss = keras.losses.Huber(
+                delta=self.asymmetric_huber_delta,
+            )
+
+        elif self.loss == "mae":
+            selected_loss = (
+                keras.losses.MeanAbsoluteError()
+            )
+
+        elif self.loss == "mse":
+            selected_loss = (
+                keras.losses.MeanSquaredError()
+            )
+
+        else:
+            # _validate_configuration() should prevent this branch,
+            # but keep the error explicit if build_model() is called
+            # after mutating self.loss directly.
+            raise ValueError(
+                f"Unsupported loss: {self.loss}"
+            )
 
         self.model.compile(
             optimizer=optimizer,
             loss=selected_loss,
             metrics=[
-                keras.metrics.MeanAbsoluteError(name="mae"),
-                keras.metrics.RootMeanSquaredError(name="rmse"),
+                keras.metrics.MeanAbsoluteError(
+                    name="mae"
+                ),
+                keras.metrics.RootMeanSquaredError(
+                    name="rmse"
+                ),
             ],
         )
 

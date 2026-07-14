@@ -1047,6 +1047,18 @@ class ExperimentService:
             "loss": config[
                 "loss"
             ],
+            "asymmetric_huber_late_weight": config.get(
+                "asymmetric_huber_late_weight",
+                2.5,
+            ),
+            "asymmetric_huber_delta": config.get(
+                "asymmetric_huber_delta",
+                10.0,
+            ),
+            "optimizer_clipnorm": config.get(
+                "optimizer_clipnorm",
+                1.0,
+            ),
             "batch_size": config[
                 "batch_size"
             ],
@@ -1239,6 +1251,508 @@ class ExperimentService:
                 metrics
             ),
             "predictions": results,
+        }
+
+    @staticmethod
+    def _production_status(
+        predicted_rul: float,
+        red_threshold: float,
+        yellow_threshold: float,
+    ) -> str:
+        if predicted_rul <= red_threshold:
+            return "Red"
+
+        if predicted_rul <= yellow_threshold:
+            return "Yellow"
+
+        return "Green"
+
+    def _load_production_wrapper(
+        self,
+        experiments_folder: str | Path,
+        experiment_name: str,
+        data_folder: str | Path,
+    ) -> tuple[Any, Any, dict[str, Any], str]:
+        """
+        Load a saved experiment and reconstruct the correct prediction wrapper.
+        """
+        self.select_experiments_folder(
+            experiments_folder
+        )
+
+        if self.manager is None:
+            raise RuntimeError(
+                "ExperimentManager is unavailable."
+            )
+
+        loaded = self.manager.load_experiment(
+            experiment_name
+        )
+
+        saved_config = dict(
+            loaded.config or {}
+        )
+
+        model_family = (
+            loaded.metadata.get(
+                "model_family"
+            )
+            or saved_config.get(
+                "model_family"
+            )
+        )
+
+        if model_family == "sklearn":
+            model_family = "tabular"
+
+        if model_family == "tensorflow":
+            model_family = "sequence"
+
+        training_data = self.load_training_data(
+            data_folder=saved_config.get(
+                "data_folder",
+                data_folder,
+            ),
+            datasets=saved_config.get(
+                "datasets",
+                ["FD001"],
+            ),
+            remove_nulls=bool(
+                saved_config.get(
+                    "remove_nulls",
+                    True,
+                )
+            ),
+            clip_rul=bool(
+                saved_config.get(
+                    "clip_rul",
+                    False,
+                )
+            ),
+            rul_cap=int(
+                saved_config.get(
+                    "rul_cap",
+                    125,
+                )
+            ),
+        )
+
+        if model_family == "tabular":
+            wrapper = self._rebuild_tabular_wrapper(
+                training_data=training_data,
+                saved_config=saved_config,
+                loaded=loaded,
+            )
+
+        elif model_family == "sequence":
+            wrapper = self._rebuild_sequence_wrapper(
+                training_data=training_data,
+                saved_config=saved_config,
+                loaded=loaded,
+            )
+
+        else:
+            raise ValueError(
+                f"Unsupported saved model family: {model_family}"
+            )
+
+        return (
+            wrapper,
+            loaded,
+            saved_config,
+            model_family,
+        )
+
+    def production_fleet_snapshot(
+        self,
+        experiments_folder: str | Path,
+        experiment_name: str,
+        data_folder: str | Path,
+        red_threshold: float = 25.0,
+        yellow_threshold: float = 60.0,
+    ) -> dict[str, Any]:
+        """
+        Predict one current RUL value per turbine from the official test files.
+        """
+        self.select_experiments_folder(
+            experiments_folder
+        )
+
+        if self.manager is None:
+            raise RuntimeError(
+                "ExperimentManager is unavailable."
+            )
+
+        loaded = self.manager.load_experiment(
+            experiment_name
+        )
+
+        saved_config = dict(
+            loaded.config or {}
+        )
+
+        datasets = self.resolve_datasets(
+            saved_config.get(
+                "datasets",
+                ["FD001"],
+            )
+        )
+
+        outcome = self.run_external_test(
+            experiment_name=experiment_name,
+            data_folder=data_folder,
+            datasets=datasets,
+            clip_rul=bool(
+                saved_config.get(
+                    "clip_rul",
+                    False,
+                )
+            ),
+            rul_cap=int(
+                saved_config.get(
+                    "rul_cap",
+                    125,
+                )
+            ),
+            experiments_folder=experiments_folder,
+        )
+
+        fleet = outcome["predictions"].copy()
+
+        prediction_column = (
+            "predicted_RUL"
+            if "predicted_RUL" in fleet.columns
+            else "predicted"
+            if "predicted" in fleet.columns
+            else None
+        )
+
+        if prediction_column is None:
+            raise ValueError(
+                "The production prediction table does not contain "
+                "a predicted RUL column."
+            )
+
+        fleet["predicted_RUL"] = pd.to_numeric(
+            fleet[prediction_column],
+            errors="coerce",
+        )
+
+        fleet["status"] = fleet[
+            "predicted_RUL"
+        ].map(
+            lambda value: self._production_status(
+                float(value),
+                float(red_threshold),
+                float(yellow_threshold),
+            )
+        )
+
+        keep_columns = [
+            column
+            for column in (
+                "unique_motor_id",
+                "dataset",
+                "unit_number",
+                "cycle",
+                "predicted_RUL",
+                "status",
+                "official_RUL",
+                "official_final_RUL",
+                "actual",
+                "absolute_error",
+            )
+            if column in fleet.columns
+        ]
+
+        fleet = (
+            fleet[keep_columns]
+            .sort_values(
+                "predicted_RUL",
+                ascending=True,
+            )
+            .reset_index(drop=True)
+        )
+
+        counts = (
+            fleet["status"]
+            .value_counts()
+            .to_dict()
+        )
+
+        return {
+            "experiment_name": experiment_name,
+            "experiments_folder": str(
+                experiments_folder
+            ),
+            "datasets": datasets,
+            "fleet": fleet,
+            "counts": {
+                "Red": int(
+                    counts.get("Red", 0)
+                ),
+                "Yellow": int(
+                    counts.get("Yellow", 0)
+                ),
+                "Green": int(
+                    counts.get("Green", 0)
+                ),
+            },
+        }
+
+    def production_turbine_editor(
+        self,
+        experiments_folder: str | Path,
+        experiment_name: str,
+        data_folder: str | Path,
+        unique_motor_id: str,
+    ) -> dict[str, Any]:
+        """
+        Return the latest editable parameter values for one test turbine.
+        """
+        self.select_experiments_folder(
+            experiments_folder
+        )
+
+        if self.manager is None:
+            raise RuntimeError(
+                "ExperimentManager is unavailable."
+            )
+
+        loaded = self.manager.load_experiment(
+            experiment_name
+        )
+
+        saved_config = dict(
+            loaded.config or {}
+        )
+
+        test_data = self.load_test_data_with_rul(
+            data_folder=data_folder,
+            datasets=self.resolve_datasets(
+                saved_config.get(
+                    "datasets",
+                    ["FD001"],
+                )
+            ),
+            remove_nulls=bool(
+                saved_config.get(
+                    "remove_nulls",
+                    True,
+                )
+            ),
+            clip_rul=False,
+            rul_cap=int(
+                saved_config.get(
+                    "rul_cap",
+                    125,
+                )
+            ),
+        )
+
+        turbine = test_data.loc[
+            test_data["unique_motor_id"]
+            == unique_motor_id
+        ].sort_values(
+            saved_config.get(
+                "time_column",
+                "cycle",
+            )
+        )
+
+        if turbine.empty:
+            raise ValueError(
+                f"Turbine '{unique_motor_id}' was not found."
+            )
+
+        latest = turbine.iloc[-1]
+
+        parameter_columns = [
+            column
+            for column in (
+                [
+                    "setting_1",
+                    "setting_2",
+                    "setting_3",
+                ]
+                + [
+                    f"sensor_{number}"
+                    for number in range(1, 22)
+                ]
+            )
+            if column in turbine.columns
+        ]
+
+        values = {
+            column: float(latest[column])
+            for column in parameter_columns
+        }
+
+        return {
+            "unique_motor_id": unique_motor_id,
+            "dataset": latest.get(
+                "dataset"
+            ),
+            "unit_number": int(
+                latest.get(
+                    "unit_number"
+                )
+            ),
+            "cycle": int(
+                latest.get(
+                    "cycle"
+                )
+            ),
+            "parameter_columns": (
+                parameter_columns
+            ),
+            "values": values,
+        }
+
+    def predict_production_turbine(
+        self,
+        experiments_folder: str | Path,
+        experiment_name: str,
+        data_folder: str | Path,
+        unique_motor_id: str,
+        updated_values: dict[str, Any],
+        red_threshold: float = 25.0,
+        yellow_threshold: float = 60.0,
+    ) -> dict[str, Any]:
+        """
+        Replace the latest telemetry values for one turbine and predict its RUL.
+        """
+        (
+            wrapper,
+            _loaded,
+            saved_config,
+            model_family,
+        ) = self._load_production_wrapper(
+            experiments_folder=experiments_folder,
+            experiment_name=experiment_name,
+            data_folder=data_folder,
+        )
+
+        test_data = self.load_test_data_with_rul(
+            data_folder=data_folder,
+            datasets=self.resolve_datasets(
+                saved_config.get(
+                    "datasets",
+                    ["FD001"],
+                )
+            ),
+            remove_nulls=bool(
+                saved_config.get(
+                    "remove_nulls",
+                    True,
+                )
+            ),
+            clip_rul=False,
+            rul_cap=int(
+                saved_config.get(
+                    "rul_cap",
+                    125,
+                )
+            ),
+        )
+
+        time_column = saved_config.get(
+            "time_column",
+            "cycle",
+        )
+
+        turbine = (
+            test_data.loc[
+                test_data["unique_motor_id"]
+                == unique_motor_id
+            ]
+            .sort_values(time_column)
+            .copy()
+        )
+
+        if turbine.empty:
+            raise ValueError(
+                f"Turbine '{unique_motor_id}' was not found."
+            )
+
+        latest_index = turbine.index[-1]
+
+        editable_columns = {
+            "setting_1",
+            "setting_2",
+            "setting_3",
+            *{
+                f"sensor_{number}"
+                for number in range(1, 22)
+            },
+        }
+
+        for column, value in (
+            updated_values or {}
+        ).items():
+            if (
+                column in editable_columns
+                and column in turbine.columns
+            ):
+                turbine.loc[
+                    latest_index,
+                    column,
+                ] = float(value)
+
+        turbine = self._add_operating_condition(
+            turbine
+        )
+
+        if model_family == "tabular":
+            latest_row = turbine.tail(1)
+            prediction = float(
+                wrapper.predict(
+                    latest_row
+                )[0]
+            )
+
+        else:
+            sequence_results = (
+                wrapper.predict_external(
+                    turbine
+                )
+            )
+
+            if sequence_results.empty:
+                raise ValueError(
+                    "The selected turbine does not have enough "
+                    "history to generate a sequence prediction."
+                )
+
+            prediction_column = (
+                "predicted"
+                if "predicted"
+                in sequence_results.columns
+                else "predicted_RUL"
+            )
+
+            prediction = float(
+                sequence_results.iloc[-1][
+                    prediction_column
+                ]
+            )
+
+        prediction = max(
+            0.0,
+            prediction,
+        )
+
+        return {
+            "unique_motor_id": unique_motor_id,
+            "predicted_RUL": prediction,
+            "status": self._production_status(
+                prediction,
+                float(red_threshold),
+                float(yellow_threshold),
+            ),
+            "updated_values": self._json_safe(
+                updated_values
+            ),
         }
 
     def _rebuild_tabular_wrapper(
@@ -1482,6 +1996,22 @@ class ExperimentService:
             "loss": saved_config.get(
                 "loss",
                 "huber",
+            ),
+            "asymmetric_huber_late_weight": (
+                saved_config.get(
+                    "asymmetric_huber_late_weight",
+                    2.5,
+                )
+            ),
+            "asymmetric_huber_delta": (
+                saved_config.get(
+                    "asymmetric_huber_delta",
+                    10.0,
+                )
+            ),
+            "optimizer_clipnorm": saved_config.get(
+                "optimizer_clipnorm",
+                1.0,
             ),
             "batch_size": saved_config.get(
                 "batch_size",
@@ -2070,3 +2600,4 @@ class ExperimentService:
             ),
             title=f"Saved experiments by {metric}",
         )
+    
