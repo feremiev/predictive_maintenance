@@ -470,6 +470,15 @@ class ExperimentManager:
                     "external_test_method": external_metrics.get(
                         "evaluation_method"
                     ),
+                    "train_NASA_SCORE": train_metrics.get(
+                        "NASA_SCORE"
+                    ),
+                    "validation_NASA_SCORE": validation_metrics.get(
+                        "NASA_SCORE"
+                    ),
+                    "external_test_NASA_SCORE": external_metrics.get(
+                        "NASA_SCORE"
+                    ),
                     "folder": str(folder),
                 }
             )
@@ -481,7 +490,7 @@ class ExperimentManager:
         experiments: Optional[
             Sequence[str | Path]
         ] = None,
-        sort_by: str = "validation_RMSE",
+        sort_by: str = "validation_NASA_SCORE",
         ascending: bool = True,
     ) -> pd.DataFrame:
         """
@@ -548,6 +557,15 @@ class ExperimentManager:
                         ),
                         "external_test_R2": external_metrics.get(
                             "R2"
+                        ),
+                        "train_NASA_SCORE": train_metrics.get(
+                            "NASA_SCORE"
+                        ),
+                        "validation_NASA_SCORE": validation_metrics.get(
+                            "NASA_SCORE"
+                        ),
+                        "external_test_NASA_SCORE": external_metrics.get(
+                            "NASA_SCORE"
                         ),
                         "external_test_method": external_metrics.get(
                             "evaluation_method"
@@ -1758,58 +1776,109 @@ class LoadedExperiment:
         """
         Plot a saved training metric and its validation equivalent.
 
-        Examples
-        --------
-        plot_training_history("loss")
-        plot_training_history("mae")
-        plot_training_history("rmse")
+        Standard Keras metrics can be requested without the ``val_`` prefix:
+
+            plot_training_history("loss")
+            plot_training_history("mae")
+            plot_training_history("rmse")
+
+        Validation-only metrics can be requested either with or without it:
+
+            plot_training_history("nasa_score")
+            plot_training_history("val_nasa_score")
         """
-        import matplotlib.pyplot as plt
 
         if self.history is None:
             raise FileNotFoundError(
                 "No training history was saved."
             )
 
-        if metric not in self.history.columns:
+        history = self.history
+
+        if history.empty:
             raise ValueError(
-                f"Metric '{metric}' is not available. "
-                f"Available columns: "
-                f"{list(self.history.columns)}"
+                "The saved training history is empty."
             )
 
-        validation_metric = (
-            f"val_{metric}"
-        )
+        metric = metric.strip()
+
+        if not metric:
+            raise ValueError(
+                "metric cannot be empty."
+            )
+
+        # Accept either:
+        #     nasa_score
+        #     val_nasa_score
+        #
+        # If the unprefixed metric is unavailable but its validation
+        # version exists, treat it as a validation-only metric.
+        if metric.startswith("val_"):
+            train_metric = None
+            validation_metric = metric
+
+        else:
+            train_metric = (
+                metric
+                if metric in history.columns
+                else None
+            )
+
+            possible_validation_metric = f"val_{metric}"
+
+            validation_metric = (
+                possible_validation_metric
+                if possible_validation_metric in history.columns
+                else None
+            )
+
+        available_metrics = [
+            key
+            for key in [
+                train_metric,
+                validation_metric,
+            ]
+            if key is not None
+        ]
+
+        if not available_metrics:
+            raise ValueError(
+                f"Metric '{metric}' is not available. "
+                f"Available columns: {list(history.columns)}"
+            )
 
         plt.figure(figsize=(8, 5))
 
-        plt.plot(
-            self.history[metric],
-            label=f"Train {metric}",
-        )
-
-        if (
-            validation_metric
-            in self.history.columns
-        ):
+        if train_metric is not None:
             plt.plot(
-                self.history[
-                    validation_metric
-                ],
-                label=(
-                    f"Validation {metric}"
-                ),
+                history[train_metric],
+                label=f"Train {train_metric}",
             )
 
+        if validation_metric is not None:
+            validation_label = (
+                validation_metric.removeprefix("val_")
+            )
+
+            plt.plot(
+                history[validation_metric],
+                label=f"Validation {validation_label}",
+            )
+
+        display_metric = metric.removeprefix("val_")
+
         plt.xlabel("Epoch")
-        plt.ylabel(metric)
+        plt.ylabel(
+            display_metric.replace("_", " ").upper()
+        )
         plt.title(
-            f"Training History — {metric}"
+            "Training History — "
+            f"{display_metric.replace('_', ' ').upper()}"
         )
         plt.legend()
         plt.tight_layout()
         plt.show()
+
 
     def plot_predictions(
         self,

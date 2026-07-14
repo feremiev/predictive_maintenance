@@ -24,7 +24,11 @@ from tensorflow.keras import layers
 from sklearn.base import clone
 
 from preprocessors.cmapss_preprocessor import CMapssPreprocessor
+from utils.s_score_parameter import PHMMetrics
 
+from utils.validation_metric_callback import (
+    ValidationMetricCallback,
+)
 
 class SequenceRULModel:
     """
@@ -1142,20 +1146,32 @@ class SequenceRULModel:
     # Training and development evaluation
     # ==========================================================
 
-    def _create_callbacks(self) -> list:
-        callbacks = [
+    def _create_callbacks(self) -> list[keras.callbacks.Callback]:
+        nasa_score_callback = ValidationMetricCallback(
+            X_validation=self.X_validation,
+            y_validation=self.y_validation,
+            metric_function=PHMMetrics.nasa_score,
+            metric_name="nasa_score",
+            batch_size=self.batch_size,
+            verbose=self.verbose,
+        )
+
+        callbacks: list[keras.callbacks.Callback] = [
+            nasa_score_callback,
             keras.callbacks.EarlyStopping(
-                monitor="val_loss",
+                monitor="val_nasa_score",
+                mode="min",
                 patience=self.patience,
                 restore_best_weights=True,
                 verbose=1,
-            )
+            ),
         ]
 
         if self.reduce_lr:
             callbacks.append(
                 keras.callbacks.ReduceLROnPlateau(
-                    monitor="val_loss",
+                    monitor="val_nasa_score",
+                    mode="min",
                     factor=self.reduce_lr_factor,
                     patience=self.reduce_lr_patience,
                     min_lr=self.min_learning_rate,
@@ -1276,6 +1292,18 @@ class SequenceRULModel:
                 * 100
             ),
             "Bias": float(residuals.mean()),
+             "NASA_SCORE": float(
+                    PHMMetrics.nasa_score(
+                        y_true_array,
+                        y_pred_array
+                    )
+                ),
+            "MEAN_NASA_SCORE": float(
+                PHMMetrics.mean_nasa_score(
+                    y_true_array,
+                    y_pred_array,
+                )
+            ),
         }
 
     def get_metrics(self) -> dict[str, dict[str, float]]:
@@ -1742,48 +1770,68 @@ class SequenceRULModel:
         self,
         metric: str = "loss",
     ) -> None:
-        """
-        Plot training and validation error by epoch.
+            """
+            Plot a metric recorded during training.
 
-        Examples:
-            metric="loss"
-            metric="mae"
-            metric="rmse"
-        """
-        if self.history is None:
-            raise RuntimeError(
-                "The model has not been trained."
+            Examples:
+                metric="loss"
+                metric="mae"
+                metric="rmse"
+                metric="nasa_score"
+            """
+            if self.history is None:
+                raise RuntimeError(
+                    "The model has not been trained."
+                )
+
+            history = self.history.history
+
+            # NASA score is calculated only on validation data.
+            if metric == "nasa_score":
+                metric_key = "val_nasa_score"
+
+                if metric_key not in history:
+                    raise ValueError(
+                        f"Metric '{metric_key}' is not available. "
+                        f"Available values: {list(history)}"
+                    )
+
+                plt.figure(figsize=(8, 5))
+                plt.plot(
+                    history[metric_key],
+                    label="Validation NASA score",
+                )
+
+            else:
+                if metric not in history:
+                    raise ValueError(
+                        f"Metric '{metric}' is not available. "
+                        f"Available values: {list(history)}"
+                    )
+
+                validation_metric = f"val_{metric}"
+
+                plt.figure(figsize=(8, 5))
+                plt.plot(
+                    history[metric],
+                    label=f"Train {metric}",
+                )
+
+                if validation_metric in history:
+                    plt.plot(
+                        history[validation_metric],
+                        label=f"Validation {metric}",
+                    )
+
+            plt.xlabel("Epoch")
+            plt.ylabel(metric.upper())
+            plt.title(
+                f"Training History — {metric.upper()} — "
+                f"{self.model_type}"
             )
-
-        if metric not in self.history.history:
-            raise ValueError(
-                f"Metric '{metric}' is not available. "
-                f"Available values: {list(self.history.history)}"
-            )
-
-        validation_metric = f"val_{metric}"
-
-        plt.figure(figsize=(8, 5))
-        plt.plot(
-            self.history.history[metric],
-            label=f"Train {metric}",
-        )
-
-        if validation_metric in self.history.history:
-            plt.plot(
-                self.history.history[validation_metric],
-                label=f"Validation {metric}",
-            )
-
-        plt.xlabel("Epoch")
-        plt.ylabel(metric.upper())
-        plt.title(
-            f"Training and Validation {metric.upper()} — "
-            f"{self.model_type}"
-        )
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
+            plt.legend()
+            plt.tight_layout()
+            plt.show()
 
     def plot_predictions(
         self,

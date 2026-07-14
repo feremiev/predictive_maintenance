@@ -204,6 +204,8 @@ def metrics_dataframe(
         }
 
         for metric_name in (
+            "NASA_SCORE",
+            "MEAN_NASA_SCORE",
             "MAE",
             "RMSE",
             "R2",
@@ -424,6 +426,17 @@ def history_figure(
 
     figure = go.Figure()
 
+    if "val_nasa_score" in frame.columns:
+        figure.add_trace(
+            go.Scatter(
+                x=frame["epoch"],
+                y=frame["val_nasa_score"],
+                mode="lines",
+                name="Validation NASA score",
+                yaxis="y",
+            )
+        )
+
     for column in (
         "loss",
         "val_loss",
@@ -439,17 +452,40 @@ def history_figure(
                     y=frame[column],
                     mode="lines",
                     name=column,
+                    yaxis="y2",
                 )
             )
 
+    if not figure.data:
+        return empty_figure(
+            "Training history — no supported metrics found"
+        )
+
     figure.update_layout(
-        title="Training and validation error by epoch",
-        xaxis_title="Epoch",
-        yaxis_title="Metric value",
+        title="Training history — NASA score and regression metrics",
+        xaxis={
+            "title": "Epoch",
+        },
+        yaxis={
+            "title": "NASA score",
+            "side": "left",
+        },
+        yaxis2={
+            "title": "Loss / MAE / RMSE",
+            "overlaying": "y",
+            "side": "right",
+            "showgrid": False,
+        },
+        legend={
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.02,
+            "xanchor": "left",
+            "x": 0,
+        },
     )
 
     return figure
-
 
 # =====================================================================
 # Sidebar
@@ -968,9 +1004,25 @@ development_metric_cards = dbc.Row(
     [
         dbc.Col(
             metric_card(
+                "Train NASA Score",
+                "train-nasa-score",
+                "NASA PHM score on the training motors (lower is better).",
+            ),
+            md=3,
+        ),
+        dbc.Col(
+            metric_card(
+                "Validation NASA Score",
+                "validation-nasa-score",
+                "Primary optimization metric on held-out validation motors.",
+            ),
+            md=3,
+        ),
+        dbc.Col(
+            metric_card(
                 "Train MAE",
                 "train-mae",
-                "Error on motors used to fit the model",
+                "Mean absolute error on the training motors.",
             ),
             md=3,
         ),
@@ -978,7 +1030,7 @@ development_metric_cards = dbc.Row(
             metric_card(
                 "Validation MAE",
                 "validation-mae",
-                "Error on held-out training-file motors",
+                "Mean absolute error on the validation motors.",
             ),
             md=3,
         ),
@@ -986,7 +1038,7 @@ development_metric_cards = dbc.Row(
             metric_card(
                 "Train RMSE",
                 "train-rmse",
-                "Training error with stronger penalty for large misses",
+                "Training error with stronger penalty for large misses.",
             ),
             md=3,
         ),
@@ -994,14 +1046,13 @@ development_metric_cards = dbc.Row(
             metric_card(
                 "Validation RMSE",
                 "validation-rmse",
-                "Primary development comparison metric",
+                "Validation RMSE for comparison with published results.",
             ),
             md=3,
         ),
     ],
     className="g-3 mb-3",
 )
-
 
 development_results_section = html.Div(
     [
@@ -1747,16 +1798,20 @@ RUN_KEYS = [
 def create_run_config(
     state_values: dict[str, Any],
 ) -> dict[str, Any]:
-    return {
-        "data_folder": state_values[
-            "data_folder"
-        ],
+    model_family = state_values["model_family"]
+
+    config = {
+        "data_folder": state_values["data_folder"],
         "datasets": state_values["datasets"],
-        "remove_nulls": state_values[
-            "remove_nulls"
-        ],
-        "clip_rul": state_values["clip_rul"],
-        "rul_cap": int(state_values["rul_cap"]),
+        "remove_nulls": bool(
+            state_values["remove_nulls"]
+        ),
+        "clip_rul": bool(
+            state_values["clip_rul"]
+        ),
+        "rul_cap": int(
+            state_values["rul_cap"] or 125
+        ),
         "target_column": state_values[
             "target_column"
         ],
@@ -1766,9 +1821,7 @@ def create_run_config(
         "time_column": state_values[
             "time_column"
         ],
-        "model_family": state_values[
-            "model_family"
-        ],
+        "model_family": model_family,
         "model_name": state_values[
             "model_name"
         ],
@@ -1789,46 +1842,95 @@ def create_run_config(
             state_values["model_params"]
         ),
         "validation_group_count": int(
-            state_values[
-                "validation_group_count"
-            ]
+            state_values["validation_group_count"]
+            or 1
         ),
         "group_selection": state_values[
             "group_selection"
         ],
         "random_state": int(
             state_values["random_state"]
+            or 42
         ),
-        "window_type": state_values[
-            "window_type"
-        ],
-        "window_size": int(
-            state_values["window_size"]
-        ),
-        "min_window_size": int(
-            state_values["min_window_size"]
-        ),
-        "max_window_size": int(
-            state_values["max_window_size"]
-        ),
-        "stride": int(state_values["stride"]),
-        "prediction_horizon": int(
-            state_values["prediction_horizon"]
-        ),
-        "scaler": state_values["scaler"],
-        "epochs": int(state_values["epochs"]),
-        "batch_size": int(
-            state_values["batch_size"]
-        ),
-        "learning_rate": float(
-            state_values["learning_rate"]
-        ),
-        "patience": int(
-            state_values["patience"]
-        ),
-        "loss": state_values["loss"],
     }
 
+    if model_family == "sequence":
+        config.update(
+            {
+                "window_type": (
+                    state_values["window_type"]
+                    or "sliding"
+                ),
+                "window_size": int(
+                    state_values["window_size"]
+                    or 30
+                ),
+                "min_window_size": int(
+                    state_values["min_window_size"]
+                    or 10
+                ),
+                "max_window_size": int(
+                    state_values["max_window_size"]
+                    or 60
+                ),
+                "stride": int(
+                    state_values["stride"]
+                    or 1
+                ),
+                "prediction_horizon": int(
+                    state_values["prediction_horizon"]
+                    or 0
+                ),
+                "scaler": (
+                    state_values["scaler"]
+                    or "standard"
+                ),
+                "epochs": int(
+                    state_values["epochs"]
+                    or 100
+                ),
+                "batch_size": int(
+                    state_values["batch_size"]
+                    or 64
+                ),
+                "learning_rate": float(
+                    state_values["learning_rate"]
+                    if state_values["learning_rate"]
+                    is not None
+                    else 0.001
+                ),
+                "patience": int(
+                    state_values["patience"]
+                    or 12
+                ),
+                "loss": (
+                    state_values["loss"]
+                    or "huber"
+                ),
+            }
+        )
+
+    else:
+        # These values are not used by tabular models, but keeping defaults
+        # makes the configuration structure predictable.
+        config.update(
+            {
+                "window_type": None,
+                "window_size": None,
+                "min_window_size": None,
+                "max_window_size": None,
+                "stride": None,
+                "prediction_horizon": None,
+                "scaler": None,
+                "epochs": None,
+                "batch_size": None,
+                "learning_rate": None,
+                "patience": None,
+                "loss": None,
+            }
+        )
+
+    return config
 
 # =====================================================================
 # Train callback
@@ -1849,6 +1951,14 @@ def create_run_config(
     ),
     Output(
         "run-status",
+        "children",
+    ),
+    Output(
+    "train-nasa-score",
+    "children",
+    ),
+    Output(
+        "validation-nasa-score",
         "children",
     ),
     Output(
@@ -2030,6 +2140,12 @@ def run_experiment(
             validation_records,
             status,
             format_metric(
+                train_values.get("NASA_SCORE")
+            ),
+            format_metric(
+                validation_values.get("NASA_SCORE")
+            ),
+            format_metric(
                 train_values.get("MAE")
             ),
             format_metric(
@@ -2051,7 +2167,7 @@ def run_experiment(
             ],
             metric_comparison_figure(
                 metrics,
-                "RMSE",
+                "NASA_SCORE",
             ),
             history_figure(history),
             prediction_figure(
@@ -2100,10 +2216,12 @@ def run_experiment(
             no_update,
             no_update,
             alert,
-            "—",
-            "—",
-            "—",
-            "—",
+            "—",  # Train NASA
+            "—",  # Validation NASA
+            "—",  # Train MAE
+            "—",  # Validation MAE
+            "—",  # Train RMSE
+            "—",  # Validation RMSE
             [],
             [],
             empty,

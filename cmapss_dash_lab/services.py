@@ -1494,7 +1494,7 @@ class ExperimentService:
         experiment_names: Sequence[str],
     ) -> pd.DataFrame:
         """
-        Compare selected experiments using validation RMSE by default.
+        Compare selected experiments using validation NASA score by default.
 
         External-test columns remain visible when those results exist.
         """
@@ -1505,12 +1505,14 @@ class ExperimentService:
             experiments=list(
                 experiment_names
             ),
-            sort_by="validation_RMSE",
+            sort_by="validation_NASA_SCORE",
+            ascending=True,
         )
 
         return self._clean_dataframe(
             frame
         )
+
 
     def load_saved(
         self,
@@ -1589,6 +1591,31 @@ class ExperimentService:
     # =================================================================
 
     @staticmethod
+    def compare_experiments(
+        self,
+        experiment_names: Sequence[str],
+    ) -> pd.DataFrame:
+        """
+        Compare selected experiments using validation NASA score by default.
+
+        External-test columns remain visible when those results exist.
+        """
+        if self.manager is None:
+            return pd.DataFrame()
+
+        frame = self.manager.compare_experiments(
+            experiments=list(
+                experiment_names
+            ),
+            sort_by="validation_NASA_SCORE",
+            ascending=True,
+        )
+
+        return self._clean_dataframe(
+            frame
+        )
+
+    @staticmethod
     def select_primary_metrics(
         metrics: dict[str, Any],
     ) -> dict[str, Any]:
@@ -1611,6 +1638,8 @@ class ExperimentService:
         if any(
             key in metrics
             for key in (
+                "NASA_SCORE",
+                "MEAN_NASA_SCORE",
                 "MAE",
                 "RMSE",
                 "R2",
@@ -1894,6 +1923,8 @@ class ExperimentService:
             "val_mae",
             "rmse",
             "val_rmse",
+            "val_nasa_score",
+            "val_mean_nasa_score",
         ):
             if column in frame.columns:
                 figure.add_trace(
@@ -1906,9 +1937,7 @@ class ExperimentService:
                 )
 
         figure.update_layout(
-            title=(
-                "Training and validation history"
-            ),
+            title="Training and validation history",
             xaxis_title="Epoch",
             yaxis_title="Metric value",
         )
@@ -1928,13 +1957,16 @@ class ExperimentService:
             (
                 column
                 for column in (
+                    "validation_NASA_SCORE",
+                    "external_test_NASA_SCORE",
+                    "validation_MEAN_NASA_SCORE",
+                    "external_test_MEAN_NASA_SCORE",
                     "validation_RMSE",
                     "validation_MAE",
                     "external_test_RMSE",
                     "external_test_MAE",
                 )
-                if column
-                in comparison.columns
+                if column in comparison.columns
             ),
             None,
         )
@@ -1954,11 +1986,8 @@ class ExperimentService:
             y=metric,
             color=(
                 "model_type"
-                if "model_type"
-                in frame.columns
+                if "model_type" in frame.columns
                 else None
             ),
-            title=(
-                f"Saved experiments by {metric}"
-            ),
+            title=f"Saved experiments by {metric}",
         )

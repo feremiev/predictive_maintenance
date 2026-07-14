@@ -18,6 +18,7 @@ from sklearn.metrics import (
     mean_absolute_error,
     mean_squared_error,
     r2_score,
+    make_scorer,
 )
 from sklearn.model_selection import GroupKFold, cross_validate
 from sklearn.pipeline import Pipeline
@@ -31,6 +32,8 @@ from typing import Callable, Sequence, Union
 from sklearn.base import clone
 
 from preprocessors.cmapss_preprocessor import CMapssPreprocessor
+
+from utils.s_score_parameter import PHMMetrics
 
 class TimeSeriesRegressionModel:
     """
@@ -744,6 +747,12 @@ class TimeSeriesRegressionModel:
             "R2": float(r2),
             "MAPE": float(mape),
             "Bias": float(bias),
+            "NASA_SCORE": float(
+                        PHMMetrics.nasa_score(
+                                y_true_array,
+                                y_pred_array
+                            )
+                        )
         }
 
     def get_overfitting_summary(self) -> dict[str, Any]:
@@ -847,6 +856,11 @@ class TimeSeriesRegressionModel:
                 "mae": "neg_mean_absolute_error",
                 "rmse": "neg_root_mean_squared_error",
                 "r2": "r2",
+                "nasa_score": make_scorer(
+                    PHMMetrics.nasa_score,
+                    greater_is_better=False,
+                ),
+
             },
             return_train_score=True,
             n_jobs=-1,
@@ -861,6 +875,8 @@ class TimeSeriesRegressionModel:
 
         train_r2 = self.cv_results["train_r2"]
         validation_r2 = self.cv_results["validation_r2"]
+        train_nasa_score = -self.cv_results["train_nasa_score"]
+        validation_nasa_score = -self.cv_results["validation_nasa_score"]
 
         self.cv_summary = {
             "CV Train MAE mean": float(train_mae.mean()),
@@ -875,6 +891,18 @@ class TimeSeriesRegressionModel:
             "CV Train R2 std": float(train_r2.std()),
             "CV Validation R2 mean": float(validation_r2.mean()),
             "CV Validation R2 std": float(validation_r2.std()),
+             "CV Train NASA Score mean": float(
+                    train_nasa_score.mean()
+                ),
+                "CV Train NASA Score std": float(
+                    train_nasa_score.std()
+                ),
+                "CV Validation NASA Score mean": float(
+                    validation_nasa_score.mean()
+                ),
+                "CV Validation NASA Score std": float(
+                    validation_nasa_score.std()
+                ),
         }
 
         return self.cv_summary.copy()
@@ -903,6 +931,12 @@ class TimeSeriesRegressionModel:
                 "validation_RMSE": -self.cv_results["validation_rmse"],
                 "train_R2": self.cv_results["train_r2"],
                 "validation_R2": self.cv_results["validation_r2"],
+                "train_NASA_SCORE": (
+                    -self.cv_results["train_nasa_score"]
+                ),
+                "validation_NASA_SCORE": (
+                    -self.cv_results["validation_nasa_score"]
+                ),
             }
         )
 

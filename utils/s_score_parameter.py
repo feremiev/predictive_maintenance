@@ -1,7 +1,6 @@
 import numpy as np
 import pandas as pd
 
-
 class PHMMetrics:
     """Clase especializada en el cálculo y análisis de métricas asimétricas
 
