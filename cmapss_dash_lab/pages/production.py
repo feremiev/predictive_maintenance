@@ -171,9 +171,18 @@ layout = html.Div(
                             className="g-3",
                         ),
                         card(
-                            "Fleet status",
-                            dash_table.DataTable(
-                                id="production-fleet-table",
+                            "Current turbine status",
+                            html.Div(
+                                [
+                                    html.P(
+                                        (
+                                            "One row per turbine using the "
+                                            "last observed test cycle."
+                                        ),
+                                        className="text-secondary small mb-2",
+                                    ),
+                                    dash_table.DataTable(
+                                        id="production-fleet-table",
                                 page_size=15,
                                 sort_action="native",
                                 filter_action="native",
@@ -221,6 +230,8 @@ layout = html.Div(
                                         "color": "#0f5132",
                                     },
                                 ],
+                                    ),
+                                ]
                             ),
                             class_name="mt-3",
                         ),
@@ -510,17 +521,56 @@ def load_production_fleet(
             )
         )
 
-        fleet = outcome["fleet"]
+        fleet = outcome["fleet"].copy()
+
+        # The production dashboard represents the latest known state of
+        # each turbine. Official/actual RUL values belong to evaluation
+        # and are intentionally not displayed here because they are not
+        # available in a real production environment.
+        visible_columns = [
+            column
+            for column in (
+                "unique_motor_id",
+                "cycle",
+                "predicted_RUL",
+                "status",
+            )
+            if column in fleet.columns
+        ]
+
+        fleet = fleet[
+            visible_columns
+        ].copy()
+
+        if "predicted_RUL" in fleet.columns:
+            fleet["predicted_RUL"] = (
+                pd.to_numeric(
+                    fleet["predicted_RUL"],
+                    errors="coerce",
+                )
+                .round(2)
+            )
+
+        display_names = {
+            "unique_motor_id": "Turbine",
+            "cycle": "Last cycle",
+            "predicted_RUL": "Predicted RUL",
+            "status": "Status",
+        }
+
         records = fleet.to_dict(
             "records"
         )
 
         columns = [
             {
-                "name": column,
+                "name": display_names.get(
+                    column,
+                    column,
+                ),
                 "id": column,
             }
-            for column in fleet.columns
+            for column in visible_columns
         ]
 
         return (
@@ -674,7 +724,7 @@ def select_production_turbine(
             editor,
             (
                 f"Turbine {unique_motor_id} — "
-                f"cycle {editor['cycle']}"
+                f"last cycle {editor['cycle']}"
             ),
             editor_rows,
             [
@@ -859,5 +909,3 @@ def predict_updated_turbine(
                 color="danger",
             ),
         )
-
-

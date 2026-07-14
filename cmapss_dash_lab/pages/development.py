@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import traceback
+from pathlib import Path
 from typing import Any
 
 import dash_bootstrap_components as dbc
@@ -1689,6 +1690,8 @@ saved_section = html.Div(
                 page_size=15,
                 sort_action="native",
                 filter_action="native",
+                row_selectable="single",
+                selected_rows=[],
                 style_table={
                     "overflowX": "auto",
                 },
@@ -1697,6 +1700,64 @@ saved_section = html.Div(
                     "textAlign": "left",
                 },
             ),
+        ),
+        dbc.Row(
+            [
+                dbc.Col(
+                    dbc.Button(
+                        [
+                            html.I(
+                                className="bi bi-box-arrow-in-down me-2"
+                            ),
+                            "Load selected table model",
+                        ],
+                        id="load-comparison-row",
+                        color="primary",
+                        className="w-100",
+                        disabled=True,
+                    ),
+                    lg=4,
+                ),
+            ],
+            className="mt-3",
+        ),
+        card(
+            "Selected experiment configuration",
+            html.Div(
+                [
+                    html.P(
+                        (
+                            "Click a row in the comparison table to "
+                            "inspect the exact configuration used."
+                        ),
+                        id="selected-experiment-config-message",
+                        className="text-secondary mb-3",
+                    ),
+                    dash_table.DataTable(
+                        id="selected-experiment-config-table",
+                        page_size=30,
+                        style_table={
+                            "overflowX": "auto",
+                        },
+                        style_cell={
+                            "padding": "8px",
+                            "textAlign": "left",
+                            "whiteSpace": "normal",
+                            "height": "auto",
+                        },
+                        style_cell_conditional=[
+                            {
+                                "if": {
+                                    "column_id": "parameter"
+                                },
+                                "fontWeight": "600",
+                                "width": "35%",
+                            },
+                        ],
+                    ),
+                ]
+            ),
+            class_name="mt-3",
         ),
         html.Div(
             id="load-status",
@@ -1899,6 +1960,10 @@ layout = html.Div(
             id="latest-experiment-name",
         ),
         dcc.Store(
+            id="latest-experiments-folder",
+            data="experiments",
+        ),
+        dcc.Store(
             id="latest-development-metrics",
         ),
         dcc.Store(
@@ -1913,8 +1978,27 @@ layout = html.Div(
             [
                 html.Div(
                     [
-                        html.H2(
-                            "Predictive Maintenance Experiment Dashboard"
+                        html.Div(
+                            [
+                                html.H2(
+                                    "Predictive Maintenance Experiment Dashboard",
+                                    className="mb-1",
+                                ),
+                                html.Div(
+                                    [
+                                        html.Span(
+                                            "Active model: ",
+                                            className="fw-semibold",
+                                        ),
+                                        html.Span(
+                                            "No model selected",
+                                            id="active-model-title",
+                                            className="text-primary",
+                                        ),
+                                    ],
+                                    className="small mb-2",
+                                ),
+                            ]
                         ),
                         html.P(
                             "Develop with train and validation motors, then "
@@ -2286,10 +2370,6 @@ def create_and_select_experiments_folder(
         "options",
     ),
     Output(
-        "model-name",
-        "value",
-    ),
-    Output(
         "sequence-settings",
         "style",
     ),
@@ -2301,6 +2381,14 @@ def create_and_select_experiments_folder(
 def update_model_family(
     model_family: str,
 ):
+    """
+    Update only the available model options.
+
+    The selected model value is intentionally not changed here because
+    loading a saved experiment restores model-family and model-name in
+    the same operation. Returning a default model from this callback
+    would overwrite the saved model because both callbacks run together.
+    """
     if model_family == "sequence":
         options = [
             {
@@ -2315,7 +2403,6 @@ def update_model_family(
 
         return (
             options,
-            "lstm",
             {"display": "block"},
         )
 
@@ -2332,7 +2419,6 @@ def update_model_family(
 
     return (
         options,
-        "hist_gradient_boosting",
         {"display": "none"},
     )
 
@@ -2658,6 +2744,10 @@ def create_run_config(
         "data",
     ),
     Output(
+        "latest-experiments-folder",
+        "data",
+    ),
+    Output(
         "latest-development-metrics",
         "data",
     ),
@@ -2783,6 +2873,7 @@ def run_experiment(
             no_update,
             no_update,
             no_update,
+            no_update,
             alert,
             "—",  # Train NASA
             "—",  # Validation NASA
@@ -2862,6 +2953,10 @@ def run_experiment(
 
         return (
             experiment_name,
+            config.get(
+                "experiments_folder",
+                "experiments",
+            ),
             metrics,
             validation_records,
             status,
@@ -2941,6 +3036,7 @@ def run_experiment(
         )
 
         return (
+            no_update,
             no_update,
             no_update,
             no_update,
@@ -3046,8 +3142,8 @@ def run_experiment(
         "value",
     ),
     State(
-        "experiments-folder",
-        "value",
+        "latest-experiments-folder",
+        "data",
     ),
     State(
         "external-test-datasets",
@@ -3095,7 +3191,7 @@ def run_external_test(
     development_metrics: dict[str, Any] | None,
     validation_prediction_records: list[dict[str, Any]] | None,
     data_folder: str,
-    experiments_folder: str,
+    active_experiments_folder: str,
     datasets: list[str],
     rul_mode: str,
     custom_cap: int,
@@ -3152,7 +3248,8 @@ def run_external_test(
             clip_rul=clip_rul,
             rul_cap=rul_cap,
             experiments_folder=(
-                experiments_folder or "experiments"
+                active_experiments_folder
+                or "experiments"
             ),
         )
 
@@ -3725,6 +3822,189 @@ def preview_data(
             error_alert,
         )
 # =====================================================================
+# Active model and comparison-row selection
+# =====================================================================
+
+@callback(
+    Output(
+        "active-model-title",
+        "children",
+    ),
+    Input(
+        "latest-experiment-name",
+        "data",
+    ),
+)
+def update_active_model_title(
+    experiment_name,
+):
+    return (
+        experiment_name
+        if experiment_name
+        else "No model selected"
+    )
+
+
+def _selected_comparison_row(
+    selected_rows,
+    virtual_rows,
+    table_rows,
+):
+    rows = virtual_rows or table_rows or []
+
+    if not selected_rows:
+        return None
+
+    index = selected_rows[0]
+
+    if index >= len(rows):
+        return None
+
+    return rows[index]
+
+
+def _display_config_value(
+    value,
+):
+    if isinstance(
+        value,
+        (dict, list, tuple),
+    ):
+        return json.dumps(
+            value,
+            indent=2,
+            default=str,
+        )
+
+    if value is None:
+        return "None"
+
+    return str(value)
+
+
+@callback(
+    Output(
+        "selected-experiment-config-message",
+        "children",
+    ),
+    Output(
+        "selected-experiment-config-table",
+        "data",
+    ),
+    Output(
+        "selected-experiment-config-table",
+        "columns",
+    ),
+    Output(
+        "load-comparison-row",
+        "disabled",
+    ),
+    Input(
+        "comparison-table",
+        "selected_rows",
+    ),
+    State(
+        "comparison-table",
+        "derived_virtual_data",
+    ),
+    State(
+        "comparison-table",
+        "data",
+    ),
+    State(
+        "saved-experiments-folder",
+        "value",
+    ),
+)
+def inspect_comparison_row(
+    selected_rows,
+    virtual_rows,
+    table_rows,
+    experiments_folder,
+):
+    selected_row = _selected_comparison_row(
+        selected_rows,
+        virtual_rows,
+        table_rows,
+    )
+
+    if not selected_row:
+        return (
+            (
+                "Click a row in the comparison table to "
+                "inspect the exact configuration used."
+            ),
+            [],
+            [],
+            True,
+        )
+
+    experiment_name = selected_row.get(
+        "experiment_name"
+    )
+
+    if not experiment_name:
+        return (
+            "The selected row has no experiment name.",
+            [],
+            [],
+            True,
+        )
+
+    try:
+        loaded = SERVICE.load_saved(
+            experiment_name,
+            experiments_folder=(
+                experiments_folder
+                or "experiments"
+            ),
+        )
+
+        saved = loaded["loaded"]
+        config = dict(
+            saved.config or {}
+        )
+
+        config_rows = [
+            {
+                "parameter": key,
+                "value": _display_config_value(
+                    value
+                ),
+            }
+            for key, value
+            in sorted(config.items())
+        ]
+
+        return (
+            (
+                f"Configuration used by "
+                f"'{experiment_name}'."
+            ),
+            config_rows,
+            [
+                {
+                    "name": "Parameter",
+                    "id": "parameter",
+                },
+                {
+                    "name": "Value",
+                    "id": "value",
+                },
+            ],
+            False,
+        )
+
+    except Exception as exc:
+        return (
+            f"{type(exc).__name__}: {exc}",
+            [],
+            [],
+            True,
+        )
+
+
+# =====================================================================
 # Saved experiments callbacks
 # =====================================================================
 
@@ -3969,6 +4249,11 @@ def compare_selected(
         allow_duplicate=True,
     ),
     Output(
+        "latest-experiments-folder",
+        "data",
+        allow_duplicate=True,
+    ),
+    Output(
         "latest-development-metrics",
         "data",
         allow_duplicate=True,
@@ -4093,13 +4378,194 @@ def compare_selected(
         "figure",
         allow_duplicate=True,
     ),
+    Output(
+        "data-folder",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "datasets",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "remove-nulls",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "clip-rul",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "rul-cap",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "target-column",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "group-column",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "time-column",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "model-family",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "model-name",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "experiment-name",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "experiments-folder",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "columns-to-drop",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "feature-columns",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "model-params",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "validation-group-count",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "group-selection",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "random-state",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "window-type",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "window-size",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "min-window-size",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "max-window-size",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "stride",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "prediction-horizon",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "scaler",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "epochs",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "batch-size",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "learning-rate",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "patience",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "loss",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "asymmetric-huber-late-weight",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "asymmetric-huber-delta",
+        "value",
+        allow_duplicate=True,
+    ),
+    Output(
+        "optimizer-clipnorm",
+        "value",
+        allow_duplicate=True,
+    ),
     Input(
         "load-experiment",
+        "n_clicks",
+    ),
+    Input(
+        "load-comparison-row",
         "n_clicks",
     ),
     State(
         "saved-experiment-selector",
         "value",
+    ),
+    State(
+        "comparison-table",
+        "selected_rows",
+    ),
+    State(
+        "comparison-table",
+        "derived_virtual_data",
+    ),
+    State(
+        "comparison-table",
+        "data",
     ),
     State(
         "saved-experiments-folder",
@@ -4108,17 +4574,46 @@ def compare_selected(
     prevent_initial_call=True,
 )
 def load_saved_experiment(
-    n_clicks: int,
+    dropdown_clicks: int,
+    table_clicks: int,
     selected: list[str] | None,
+    selected_rows,
+    virtual_rows,
+    table_rows,
     experiments_folder: str,
 ):
-    if not n_clicks or not selected:
+    triggered_id = ctx.triggered_id
+
+    selected_row = _selected_comparison_row(
+        selected_rows,
+        virtual_rows,
+        table_rows,
+    )
+
+    if (
+        triggered_id == "load-comparison-row"
+        and selected_row
+    ):
+        experiment_name = selected_row.get(
+            "experiment_name"
+        )
+    elif selected:
+        experiment_name = selected[0]
+    else:
+        experiment_name = None
+
+    if not experiment_name:
         raise PreventUpdate
 
     try:
         loaded = SERVICE.load_saved(
-            selected[0],
+            experiment_name,
             experiments_folder=experiments_folder or "experiments",
+        )
+
+        saved_experiment = loaded["loaded"]
+        saved_config = dict(
+            saved_experiment.config or {}
         )
 
         metrics = loaded["metrics"]
@@ -4173,12 +4668,367 @@ def load_saved_experiment(
             else None
         )
 
+        saved_metadata = dict(
+            getattr(
+                saved_experiment,
+                "metadata",
+                {},
+            )
+            or {}
+        )
+
+        comparison_values = dict(
+            selected_row or {}
+        )
+
+        def saved_value(
+            *keys,
+            default=None,
+        ):
+            """
+            Read the first meaningful value from the saved configuration,
+            experiment metadata, or selected comparison-table row.
+            """
+            for source_values in (
+                saved_config,
+                saved_metadata,
+                comparison_values,
+            ):
+                for key in keys:
+                    value = source_values.get(
+                        key
+                    )
+
+                    if value is not None:
+                        return value
+
+            return default
+
+        restored_model_family = str(
+            saved_value(
+                "model_family",
+                "family",
+                default="tabular",
+            )
+        ).lower()
+
+        if restored_model_family in {
+            "sklearn",
+            "scikit-learn",
+            "scikit_learn",
+            "tabular",
+        }:
+            restored_model_family = "tabular"
+
+        elif restored_model_family in {
+            "tensorflow",
+            "keras",
+            "sequence",
+            "deep_learning",
+        }:
+            restored_model_family = "sequence"
+
+        else:
+            model_candidate = str(
+                saved_value(
+                    "model_name",
+                    "model_type",
+                    default="",
+                )
+            ).lower()
+
+            restored_model_family = (
+                "sequence"
+                if model_candidate
+                in AVAILABLE_SEQUENCE_MODELS
+                else "tabular"
+            )
+
+        restored_model_name = str(
+            saved_value(
+                "model_name",
+                "model_type",
+                "estimator_name",
+                default=(
+                    "lstm"
+                    if restored_model_family
+                    == "sequence"
+                    else "hist_gradient_boosting"
+                ),
+            )
+        ).lower()
+
+        # Older experiment files may only expose the model through the
+        # experiment name. Recover it when no valid model key was saved.
+        valid_models = (
+            AVAILABLE_SEQUENCE_MODELS
+            if restored_model_family
+            == "sequence"
+            else AVAILABLE_TABULAR_MODELS
+        )
+
+        if restored_model_name not in valid_models:
+            lowered_experiment_name = (
+                experiment_name.lower()
+            )
+
+            matching_models = sorted(
+                (
+                    model
+                    for model in valid_models
+                    if model
+                    in lowered_experiment_name
+                ),
+                key=len,
+                reverse=True,
+            )
+
+            if matching_models:
+                restored_model_name = (
+                    matching_models[0]
+                )
+
+        restored_feature_columns = saved_value(
+            "feature_columns",
+            "features",
+            default=None,
+        )
+
+        restored_columns_to_drop = saved_value(
+            "columns_to_drop",
+            "excluded_columns",
+            "columns_to_exclude",
+            default=[],
+        )
+
+        restored_model_params = saved_value(
+            "model_params",
+            "model_parameters",
+            "estimator_params",
+            default={},
+        )
+
+        restored_data_folder = str(
+            saved_value(
+                "data_folder",
+                "raw_data_folder",
+                default="raw_data",
+            )
+        )
+
+        # Experiments store the resolved absolute path for reproducibility.
+        # The interface should display the original usable folder name.
+        restored_data_path = Path(
+            restored_data_folder
+        )
+
+        if restored_data_path.is_absolute():
+            restored_data_folder = (
+                restored_data_path.name
+            )
+
+        restored_datasets = saved_value(
+            "datasets",
+            "training_datasets",
+            "dataset",
+            default=["FD001"],
+        )
+
+        if isinstance(
+            restored_datasets,
+            str,
+        ):
+            restored_datasets = [
+                restored_datasets
+            ]
+
+        restored_validation_count = saved_value(
+            "validation_group_count",
+            "validation_motor_count",
+            "validation_motors",
+            "n_validation_groups",
+            default=10,
+        )
+
+        restored_group_selection = saved_value(
+            "group_selection",
+            "validation_group_selection",
+            "motor_selection",
+            default="random",
+        )
+
+        restored_random_state = saved_value(
+            "random_state",
+            "seed",
+            "random_seed",
+            default=42,
+        )
+
+        if isinstance(
+            restored_columns_to_drop,
+            str,
+        ):
+            restored_columns_text = (
+                restored_columns_to_drop
+            )
+        else:
+            restored_columns_text = ",".join(
+                restored_columns_to_drop
+                or []
+            )
+
+        if isinstance(
+            restored_feature_columns,
+            str,
+        ):
+            restored_features_text = (
+                restored_feature_columns
+            )
+        else:
+            restored_features_text = (
+                ",".join(
+                    restored_feature_columns
+                )
+                if restored_feature_columns
+                else ""
+            )
+
+        setup_values = (
+            restored_data_folder,
+            restored_datasets,
+            bool(
+                saved_value(
+                    "remove_nulls",
+                    default=True,
+                )
+            ),
+            bool(
+                saved_value(
+                    "clip_rul",
+                    default=False,
+                )
+            ),
+            saved_value(
+                "rul_cap",
+                "rul_clip_value",
+                default=125,
+            ),
+            saved_value(
+                "target_column",
+                default="RUL",
+            ),
+            saved_value(
+                "group_column",
+                "motor_column",
+                default="unique_motor_id",
+            ),
+            saved_value(
+                "time_column",
+                "cycle_column",
+                default="cycle",
+            ),
+            restored_model_family,
+            restored_model_name,
+            experiment_name,
+            (
+                saved_value(
+                    "experiments_folder",
+                    default=experiments_folder,
+                )
+                or "experiments"
+            ),
+            restored_columns_text,
+            restored_features_text,
+            json.dumps(
+                restored_model_params
+                or {},
+                indent=2,
+                default=str,
+            ),
+            int(
+                restored_validation_count
+                or 10
+            ),
+            str(
+                restored_group_selection
+                or "random"
+            ).lower(),
+            int(
+                restored_random_state
+                if restored_random_state
+                is not None
+                else 42
+            ),
+            saved_value(
+                "window_type",
+                default="sliding",
+            ),
+            saved_value(
+                "window_size",
+                default=30,
+            ),
+            saved_value(
+                "min_window_size",
+                default=10,
+            ),
+            saved_value(
+                "max_window_size",
+                default=60,
+            ),
+            saved_value(
+                "stride",
+                default=1,
+            ),
+            saved_value(
+                "prediction_horizon",
+                default=0,
+            ),
+            saved_value(
+                "scaler",
+                "scaler_name",
+                default="standard",
+            ),
+            saved_value(
+                "epochs",
+                default=100,
+            ),
+            saved_value(
+                "batch_size",
+                default=64,
+            ),
+            saved_value(
+                "learning_rate",
+                default=0.001,
+            ),
+            saved_value(
+                "patience",
+                default=12,
+            ),
+            saved_value(
+                "loss",
+                default="huber",
+            ),
+            saved_value(
+                "asymmetric_huber_late_weight",
+                default=2.5,
+            ),
+            saved_value(
+                "asymmetric_huber_delta",
+                default=10.0,
+            ),
+            saved_value(
+                "optimizer_clipnorm",
+                default=1.0,
+            ),
+        )
+
         return (
             dbc.Alert(
-                f"Loaded '{selected[0]}'.",
+                f"Loaded '{experiment_name}'.",
                 color="success",
             ),
-            selected[0],
+            experiment_name,
+            experiments_folder or "experiments",
             metrics,
             validation_records,
             format_metric(
@@ -4267,6 +5117,7 @@ def load_saved_experiment(
                 external_predictions,
                 "Official test residuals",
             ),
+            *setup_values,
         )
 
     except Exception as exc:
@@ -4279,6 +5130,7 @@ def load_saved_experiment(
                 f"{type(exc).__name__}: {exc}",
                 color="danger",
             ),
+            no_update,
             no_update,
             no_update,
             no_update,
@@ -4305,4 +5157,8 @@ def load_saved_experiment(
             empty,
             empty,
             empty,
+            *(
+                no_update
+                for _ in range(33)
+            ),
         )

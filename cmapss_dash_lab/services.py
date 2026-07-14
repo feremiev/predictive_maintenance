@@ -2600,4 +2600,3 @@ class ExperimentService:
             ),
             title=f"Saved experiments by {metric}",
         )
-    
