@@ -1211,6 +1211,14 @@ external_test_metric_cards = dbc.Row(
     [
         dbc.Col(
             metric_card(
+                "Official test NASA Score",
+                "external-nasa-score",
+                "Primary PHM Challenge evaluation metric (lower is better)",
+            ),
+            md=3,
+        ),
+        dbc.Col(
+            metric_card(
                 "Official test MAE",
                 "external-mae",
                 "Average final RUL error per external motor",
@@ -1235,7 +1243,7 @@ external_test_metric_cards = dbc.Row(
         ),
         dbc.Col(
             metric_card(
-                "Official test bias",
+                "Official test Bias",
                 "external-bias",
                 "Positive means underprediction on average",
             ),
@@ -1244,7 +1252,6 @@ external_test_metric_cards = dbc.Row(
     ],
     className="g-3 mb-3",
 )
-
 
 official_test_section = html.Div(
     [
@@ -2246,6 +2253,7 @@ def run_experiment(
         "external-mae",
         "children",
     ),
+    Output("external-nasa-score", "children"),
     Output(
         "external-rmse",
         "children",
@@ -2567,6 +2575,7 @@ def run_external_test(
             format_metric(
                 external_metrics.get("Bias")
             ),
+            format_metric(external_metrics.get("NASA_SCORE")),
             external_frame.to_dict(
                 "records"
             ),

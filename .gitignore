@@ -26,4 +26,11 @@ models/__pycache__/base_model.cpython-310.pyc
 predictive_maintenance_dds04/raw_data/
 predictive_maintenance_dds04/utils/__pyscahe__/
 models/__pyscahe__/
- 
+ Exploration_Data.ipynb
+Exploration_Data.ipynb
+.gitignore
+model_training.ipynb
+cmapss_dash_lab/__pycache__/services.cpython-310.pyc
+experiments/
+cmapss_dash_lab/__pycache__/
+models/__pycache__/
