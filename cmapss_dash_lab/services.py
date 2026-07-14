@@ -129,6 +129,79 @@ class ExperimentService:
             else None
         )
 
+    @staticmethod
+    def _validate_experiments_folder_name(
+        folder_name: str | Path,
+    ) -> str:
+        raw_value = str(folder_name).strip() or "experiments"
+        path = Path(raw_value)
+
+        if path.is_absolute() or len(path.parts) != 1:
+            raise ValueError(
+                "Use one project-local folder name, such as "
+                "'experiments' or 'experiment_fd001'."
+            )
+
+        name = path.name
+
+        if not name.lower().startswith("experiment"):
+            raise ValueError(
+                "Experiment folders must start with 'experiment'."
+            )
+
+        if not all(
+            character.isalnum() or character in {"_", "-"}
+            for character in name
+        ):
+            raise ValueError(
+                "Use only letters, numbers, underscores, and hyphens."
+            )
+
+        return name
+
+    def select_experiments_folder(
+        self,
+        folder_name: str | Path = "experiments",
+    ) -> Path:
+        name = self._validate_experiments_folder_name(
+            folder_name
+        )
+
+        folder = PROJECT_ROOT / name
+        folder.mkdir(parents=True, exist_ok=True)
+
+        if (
+            self.manager is None
+            or folder.resolve()
+            != Path(self.manager.base_folder).resolve()
+        ):
+            self.experiments_folder = folder
+            self.manager = self.classes["ExperimentManager"](
+                base_folder=folder
+            )
+
+        return folder
+
+    def list_experiment_folders(
+        self,
+    ) -> list[str]:
+        (PROJECT_ROOT / "experiments").mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        folders = sorted(
+            path.name
+            for path in PROJECT_ROOT.iterdir()
+            if path.is_dir()
+            and path.name.lower().startswith("experiment")
+        )
+
+        if "experiments" not in folders:
+            folders.insert(0, "experiments")
+
+        return folders
+
     # =================================================================
     # Generic helpers
     # =================================================================
@@ -717,6 +790,10 @@ class ExperimentService:
             validation_predictions
             history
         """
+        self.select_experiments_folder(
+            config.get("experiments_folder", "experiments")
+        )
+
         if self.manager is None:
             raise RuntimeError(
                 "ExperimentManager is unavailable."
@@ -765,6 +842,18 @@ class ExperimentService:
             experiment
         )
 
+        learning_curve = None
+
+        if model_family == "tabular":
+            learning_curve = (
+                experiment.calculate_learning_curve()
+            )
+
+        elif model_family == "sequence":
+            learning_curve = (
+                experiment.get_learning_curve()
+            )
+
         resolved_data_folder = self._resolve_data_folder(
             config["data_folder"]
         )
@@ -783,6 +872,7 @@ class ExperimentService:
             ),
             extra_config={
                 "model_family": model_family,
+                "experiments_folder": self.experiments_folder.name,
                 "data_folder": str(
                     resolved_data_folder
                 ),
@@ -801,6 +891,17 @@ class ExperimentService:
                     config["rul_cap"]
                 ),
             },
+            extra_tables=(
+                {
+                    "learning_curve": learning_curve,
+                }
+                if isinstance(
+                    learning_curve,
+                    pd.DataFrame,
+                )
+                and not learning_curve.empty
+                else None
+            ),
         )
 
         return {
@@ -813,6 +914,7 @@ class ExperimentService:
                 validation_predictions
             ),
             "history": history,
+            "learning_curve": learning_curve,
         }
 
     def _create_tabular_model(
@@ -839,6 +941,9 @@ class ExperimentService:
             "time_column": config[
                 "time_column"
             ],
+            "feature_columns": config.get(
+                "feature_columns"
+            ),
             "model_name": config[
                 "model_name"
             ],
@@ -971,6 +1076,7 @@ class ExperimentService:
         datasets: Sequence[str],
         clip_rul: bool,
         rul_cap: int,
+        experiments_folder: str | Path = "experiments",
     ) -> dict[str, Any]:
         """
         Load a saved model, reconstruct its wrapper configuration, evaluate it
@@ -983,6 +1089,10 @@ class ExperimentService:
         Sequence models use:
             evaluate_cmapss_final_windows()
         """
+        self.select_experiments_folder(
+            experiments_folder
+        )
+
         if self.manager is None:
             raise RuntimeError(
                 "ExperimentManager is unavailable."
@@ -1226,46 +1336,22 @@ class ExperimentService:
         if loaded.scaler is not None:
             wrapper.scaler = loaded.scaler
 
-        # The external evaluator may use the saved training feature names.
-        if loaded.feature_names:
-            feature_names = list(
-                loaded.feature_names
-            )
-
-            available_features = [
-                column
-                for column in feature_names
-                if column in training_data.columns
-            ]
-
-            if available_features:
-                wrapper.X_train = training_data[
-                    available_features
-                ].copy()
-
-        # If the class needs its normal split attributes, create only the
-        # train/validation split. This does not fit the loaded pipeline.
-        if (
-            getattr(
+        # Reconstruct the raw train/validation inputs expected by the saved
+        # pipeline. feature_names.json contains processed output features and
+        # must never be used as the input DataFrame passed to the preprocessor.
+        for method_name in (
+            "split_data",
+            "split_groups",
+        ):
+            method = getattr(
                 wrapper,
-                "X_train",
+                method_name,
                 None,
             )
-            is None
-        ):
-            for method_name in (
-                "split_data",
-                "split_groups",
-            ):
-                method = getattr(
-                    wrapper,
-                    method_name,
-                    None,
-                )
 
-                if callable(method):
-                    method()
-                    break
+            if callable(method):
+                method()
+                break
 
         return wrapper
 
@@ -1475,11 +1561,16 @@ class ExperimentService:
 
     def list_experiments(
         self,
+        experiments_folder: str | Path = "experiments",
     ) -> pd.DataFrame:
         """
         Return saved experiments with train, validation, and external-test
         metrics kept in separate columns.
         """
+        self.select_experiments_folder(
+            experiments_folder
+        )
+
         if self.manager is None:
             return pd.DataFrame()
 
@@ -1492,12 +1583,17 @@ class ExperimentService:
     def compare_experiments(
         self,
         experiment_names: Sequence[str],
+        experiments_folder: str | Path = "experiments",
     ) -> pd.DataFrame:
         """
         Compare selected experiments using validation NASA score by default.
 
         External-test columns remain visible when those results exist.
         """
+        self.select_experiments_folder(
+            experiments_folder
+        )
+
         if self.manager is None:
             return pd.DataFrame()
 
@@ -1517,10 +1613,15 @@ class ExperimentService:
     def load_saved(
         self,
         experiment_name: str,
+        experiments_folder: str | Path = "experiments",
     ) -> dict[str, Any]:
         """
         Load all available artifacts required by the updated dashboard.
         """
+        self.select_experiments_folder(
+            experiments_folder
+        )
+
         if self.manager is None:
             raise RuntimeError(
                 "ExperimentManager is unavailable."
@@ -1557,6 +1658,9 @@ class ExperimentService:
                 external_test_predictions
             ),
             "history": loaded.history,
+            "learning_curve": loaded.extra_tables.get(
+                "learning_curve"
+            ),
             "loaded": loaded,
         }
 
@@ -1589,31 +1693,6 @@ class ExperimentService:
     # =================================================================
     # Metric formatting utilities
     # =================================================================
-
-    @staticmethod
-    def compare_experiments(
-        self,
-        experiment_names: Sequence[str],
-    ) -> pd.DataFrame:
-        """
-        Compare selected experiments using validation NASA score by default.
-
-        External-test columns remain visible when those results exist.
-        """
-        if self.manager is None:
-            return pd.DataFrame()
-
-        frame = self.manager.compare_experiments(
-            experiments=list(
-                experiment_names
-            ),
-            sort_by="validation_NASA_SCORE",
-            ascending=True,
-        )
-
-        return self._clean_dataframe(
-            frame
-        )
 
     @staticmethod
     def select_primary_metrics(

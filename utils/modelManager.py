@@ -1106,95 +1106,50 @@ class ExperimentManager:
             )
 
     def _save_feature_names(
-            self,
-            experiment: Any,
-            experiment_folder: Path,
-        ) -> None:
-            """
-            Save the final feature names consumed by the model.
+        self,
+        experiment: Any,
+        experiment_folder: Path,
+    ) -> None:
+        """Save the exact processed columns received by the fitted model."""
+        feature_names = getattr(
+            experiment,
+            "processed_feature_columns_",
+            None,
+        )
 
-            For sequence models, these are the processed columns after scaling and
-            operating-condition encoding.
-            """
-            feature_names = None
+        # Sequence models store this after preprocessing and before windows
+        # are generated. It is therefore the most reliable source.
+        if feature_names:
+            feature_names = list(feature_names)
 
-            processed_feature_names = getattr(
-                experiment,
-                "processed_feature_columns_",
-                None,
+        # Tabular models: ask the fitted pipeline preprocessor.
+        if not feature_names:
+            pipeline = getattr(experiment, "pipeline", None)
+            if (
+                pipeline is not None
+                and hasattr(pipeline, "named_steps")
+                and "preprocessor" in pipeline.named_steps
+            ):
+                fitted_preprocessor = pipeline.named_steps["preprocessor"]
+                if hasattr(fitted_preprocessor, "get_feature_names_out"):
+                    try:
+                        feature_names = list(
+                            fitted_preprocessor.get_feature_names_out()
+                        )
+                    except (AttributeError, RuntimeError, ValueError):
+                        feature_names = None
+
+        # Final fallback when no preprocessing step exists.
+        if not feature_names:
+            X_train = getattr(experiment, "X_train", None)
+            if isinstance(X_train, pd.DataFrame):
+                feature_names = list(X_train.columns)
+
+        if feature_names:
+            self._write_json(
+                experiment_folder / "feature_names.json",
+                feature_names,
             )
-
-            if processed_feature_names:
-                feature_names = list(
-                    processed_feature_names
-                )
-
-            elif getattr(
-                experiment,
-                "feature_columns",
-                None,
-            ) is not None:
-                feature_names = list(
-                    experiment.feature_columns
-                )
-
-            elif getattr(
-                experiment,
-                "X_train",
-                None,
-            ) is not None:
-                X_train = experiment.X_train
-
-                if isinstance(
-                    X_train,
-                    pd.DataFrame,
-                ):
-                    feature_names = list(
-                        X_train.columns
-                    )
-
-            # Tabular sklearn pipeline fallback.
-            if feature_names is None:
-                pipeline = getattr(
-                    experiment,
-                    "pipeline",
-                    None,
-                )
-
-                if (
-                    pipeline is not None
-                    and hasattr(pipeline, "named_steps")
-                    and "preprocessor" in pipeline.named_steps
-                ):
-                    fitted_preprocessor = (
-                        pipeline.named_steps[
-                            "preprocessor"
-                        ]
-                    )
-
-                    if hasattr(
-                        fitted_preprocessor,
-                        "get_feature_names_out",
-                    ):
-                        try:
-                            feature_names = list(
-                                fitted_preprocessor
-                                .get_feature_names_out()
-                            )
-                        except (
-                            AttributeError,
-                            RuntimeError,
-                            ValueError,
-                        ):
-                            feature_names = None
-
-            if feature_names is not None:
-                self._write_json(
-                    experiment_folder
-                    / "feature_names.json",
-                    feature_names,
-                )
-
 
     def _save_group_ids(
         self,

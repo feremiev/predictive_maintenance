@@ -88,6 +88,7 @@ class TimeSeriesRegressionModel:
         validation_group_count: Optional[int] = None,
         validation_group_size: float = 0.2,
         group_selection: str = "random",
+        feature_columns: Optional[Sequence[str]] = None,
         columns_to_drop: Optional[list[str]] = None,
         random_state: int = 42,
         model_params: Optional[dict[str, Any]] = None,
@@ -159,6 +160,11 @@ class TimeSeriesRegressionModel:
         self.validation_group_count = validation_group_count
         self.validation_group_size = validation_group_size
         self.group_selection = group_selection.lower()
+        self.feature_columns = (
+            list(feature_columns)
+            if feature_columns is not None
+            else None
+        )
         self.columns_to_drop = columns_to_drop or []
         self.random_state = random_state
         self.model_params = model_params or {}
@@ -200,6 +206,9 @@ class TimeSeriesRegressionModel:
         self.cv_results: Optional[dict[str, np.ndarray]] = None
         self.cv_summary: Optional[dict[str, float]] = None
 
+        # Group-aware learning-curve results.
+        self.learning_curve_results: Optional[pd.DataFrame] = None
+
         self._validate_configuration()
 
         self.preprocessor = (
@@ -207,6 +216,14 @@ class TimeSeriesRegressionModel:
             if preprocessor is not None
             else CMapssPreprocessor()
         )
+
+        if (
+            self.feature_columns is not None
+            and hasattr(self.preprocessor, "set_params")
+        ):
+            self.preprocessor.set_params(
+                feature_columns=self.feature_columns
+            )
 
         self.fitted_preprocessor = None
 
@@ -907,6 +924,133 @@ class TimeSeriesRegressionModel:
 
         return self.cv_summary.copy()
 
+    def calculate_learning_curve(
+        self,
+        train_fractions: Sequence[float] = (
+            0.20,
+            0.40,
+            0.60,
+            0.80,
+            1.00,
+        ),
+    ) -> pd.DataFrame:
+        """
+        Fit the same pipeline using progressively more complete training motors.
+
+        The validation motors remain fixed. A persistent gap between training
+        and validation error indicates overfitting.
+        """
+        if self.X_train is None or self.X_validation is None:
+            self.split_data()
+
+        if self.groups_train is None:
+            raise RuntimeError(
+                "Training groups are unavailable. Run split_data() first."
+            )
+
+        fractions = sorted(
+            {
+                float(value)
+                for value in train_fractions
+                if 0 < float(value) <= 1
+            }
+        )
+
+        if not fractions:
+            raise ValueError(
+                "train_fractions must contain values between 0 and 1."
+            )
+
+        available_groups = np.asarray(
+            self.train_group_ids
+        )
+
+        if len(available_groups) == 0:
+            raise RuntimeError(
+                "No training motors are available."
+            )
+
+        rows: list[dict[str, float | int]] = []
+
+        for fraction in fractions:
+            group_count = max(
+                1,
+                int(np.ceil(
+                    len(available_groups) * fraction
+                )),
+            )
+
+            selected_groups = set(
+                available_groups[:group_count]
+            )
+
+            train_mask = self.groups_train.isin(
+                selected_groups
+            )
+
+            X_subset = self.X_train.loc[
+                train_mask
+            ]
+
+            y_subset = self.y_train.loc[
+                train_mask
+            ]
+
+            pipeline = self._create_pipeline()
+
+            pipeline.fit(
+                X_subset,
+                y_subset,
+            )
+
+            train_predictions = pipeline.predict(
+                X_subset
+            )
+
+            validation_predictions = pipeline.predict(
+                self.X_validation
+            )
+
+            train_metrics = self._calculate_metrics(
+                y_subset,
+                train_predictions,
+            )
+
+            validation_metrics = self._calculate_metrics(
+                self.y_validation,
+                validation_predictions,
+            )
+
+            rows.append(
+                {
+                    "training_fraction": float(fraction),
+                    "training_groups": int(group_count),
+                    "training_rows": int(len(X_subset)),
+                    "train_MAE": train_metrics["MAE"],
+                    "validation_MAE": validation_metrics["MAE"],
+                    "train_RMSE": train_metrics["RMSE"],
+                    "validation_RMSE": validation_metrics["RMSE"],
+                    "train_MEAN_NASA_SCORE": float(
+                        PHMMetrics.mean_nasa_score(
+                            y_subset,
+                            train_predictions,
+                        )
+                    ),
+                    "validation_MEAN_NASA_SCORE": float(
+                        PHMMetrics.mean_nasa_score(
+                            self.y_validation,
+                            validation_predictions,
+                        )
+                    ),
+                }
+            )
+
+        self.learning_curve_results = pd.DataFrame(
+            rows
+        )
+
+        return self.learning_curve_results.copy()
+
     def get_cross_validation_folds(
         self,
     ) -> pd.DataFrame:
@@ -953,9 +1097,9 @@ class TimeSeriesRegressionModel:
         """
         self._ensure_fitted()
 
-        expected_columns = list(
-            self.X_train.columns
-        )
+        # The pipeline expects the raw columns used by its fitted
+        # preprocessor. Processed feature names are outputs, not inputs.
+        expected_columns = self._feature_columns()
 
         missing_columns = set(
             expected_columns
@@ -2120,7 +2264,10 @@ class TimeSeriesRegressionModel:
                 f"'{target_column}'."
             )
 
-        expected_columns = list(self.X_train.columns)
+        # The saved pipeline receives raw C-MAPSS columns and performs
+        # feature selection/scaling internally. Do not use processed feature
+        # names from feature_names.json as pipeline inputs.
+        expected_columns = self._feature_columns()
 
         missing_columns = set(expected_columns).difference(
             external_df.columns

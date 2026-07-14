@@ -9,7 +9,8 @@ from sklearn.preprocessing import MinMaxScaler, RobustScaler
 from preprocessors.operating_condition_encoder import OperatingConditionEncoder
 
 class CMapssPreprocessor(BaseEstimator, TransformerMixin):
-    def __init__(self):
+    def __init__(self, feature_columns=None):
+        self.feature_columns = feature_columns
         self.features_settings = [
             "setting_1",
             "setting_2",
@@ -93,6 +94,32 @@ class CMapssPreprocessor(BaseEstimator, TransformerMixin):
 
         self.operating_condition_encoder = OperatingConditionEncoder()
         self.encoded_columns_ = []
+
+    def _selected_output_columns(self) -> list[str]:
+        """Return the processed columns exposed to the model."""
+        all_columns = self.correct_order_ + self.encoded_columns_
+
+        if self.feature_columns is None:
+            return all_columns
+
+        requested = list(self.feature_columns)
+        selected: list[str] = []
+
+        for column in requested:
+            if column == "operating_condition":
+                selected.extend(self.encoded_columns_)
+            elif column in all_columns:
+                selected.append(column)
+            else:
+                raise ValueError(
+                    f"Unknown C-MAPSS feature column: {column!r}. "
+                    f"Available raw features are: "
+                    f"{self.correct_order_ + ['operating_condition']}"
+                )
+
+        # Preserve user order while removing duplicates.
+        return list(dict.fromkeys(selected))
+
     def fit(
         self,
         X: pd.DataFrame,
@@ -166,7 +193,7 @@ class CMapssPreprocessor(BaseEstimator, TransformerMixin):
         # Join both
         # ----------------------------
 
-        return pd.concat(
+        processed = pd.concat(
             [
                 scaled_df,
                 encoded,
@@ -174,14 +201,13 @@ class CMapssPreprocessor(BaseEstimator, TransformerMixin):
             axis=1,
         )
 
+        return processed[self._selected_output_columns()]
+
     def get_feature_names_out(
         self,
         input_features=None,
     ):
-            return (
-                        self.correct_order_
-                        + self.encoded_columns_
-                    )
+        return self._selected_output_columns()
 
     def _validate_columns(
         self,

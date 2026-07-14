@@ -487,6 +487,137 @@ def history_figure(
 
     return figure
 
+
+def learning_curve_figure(
+    learning_curve: pd.DataFrame | None,
+) -> go.Figure:
+    """
+    Plot the appropriate learning curve for the selected model family.
+
+    Tabular models:
+        Number of complete training motors versus train/validation MAE.
+
+    Sequence models:
+        Epoch versus train/validation MAE or loss.
+    """
+    if learning_curve is None or learning_curve.empty:
+        return empty_figure(
+            "Learning curve — no data available"
+        )
+
+    frame = learning_curve.copy()
+
+    # Classical learning curve for scikit-learn/tabular models.
+    if {
+        "training_groups",
+        "train_MAE",
+        "validation_MAE",
+    }.issubset(frame.columns):
+        frame = frame.sort_values(
+            "training_groups"
+        )
+
+        figure = go.Figure()
+
+        figure.add_trace(
+            go.Scatter(
+                x=frame["training_groups"],
+                y=frame["train_MAE"],
+                mode="lines+markers",
+                name="Train MAE",
+            )
+        )
+
+        figure.add_trace(
+            go.Scatter(
+                x=frame["training_groups"],
+                y=frame["validation_MAE"],
+                mode="lines+markers",
+                name="Validation MAE",
+            )
+        )
+
+        figure.update_layout(
+            title=(
+                "Learning curve — error by number "
+                "of training motors"
+            ),
+            xaxis_title="Training motors",
+            yaxis_title="MAE",
+            legend_title="Dataset",
+        )
+
+        return figure
+
+    # Epoch-based learning curve for TensorFlow sequence models.
+    if "epoch" not in frame.columns:
+        frame = frame.reset_index(
+            names="epoch"
+        )
+        frame["epoch"] = frame["epoch"] + 1
+
+    train_metric = next(
+        (
+            column
+            for column in (
+                "mae",
+                "rmse",
+                "loss",
+            )
+            if column in frame.columns
+        ),
+        None,
+    )
+
+    validation_metric = (
+        f"val_{train_metric}"
+        if train_metric is not None
+        and f"val_{train_metric}" in frame.columns
+        else None
+    )
+
+    if train_metric is None:
+        return empty_figure(
+            "Learning curve — no supported history metrics found"
+        )
+
+    figure = go.Figure()
+
+    figure.add_trace(
+        go.Scatter(
+            x=frame["epoch"],
+            y=frame[train_metric],
+            mode="lines",
+            name=f"Train {train_metric.upper()}",
+        )
+    )
+
+    if validation_metric is not None:
+        figure.add_trace(
+            go.Scatter(
+                x=frame["epoch"],
+                y=frame[validation_metric],
+                mode="lines",
+                name=(
+                    "Validation "
+                    f"{train_metric.upper()}"
+                ),
+            )
+        )
+
+    figure.update_layout(
+        title=(
+            "Learning curve — train vs validation "
+            "by epoch"
+        ),
+        xaxis_title="Epoch",
+        yaxis_title=train_metric.upper(),
+        legend_title="Dataset",
+    )
+
+    return figure
+
+
 # =====================================================================
 # Sidebar
 # =====================================================================
@@ -681,6 +812,41 @@ model_config_card = card(
             ],
             value="hist_gradient_boosting",
             clearable=False,
+        ),
+        dbc.Label(
+            "Experiment storage folder",
+            className="mt-3",
+        ),
+        dcc.Dropdown(
+            id="experiments-folder",
+            options=[
+                {"label": folder, "value": folder}
+                for folder in SERVICE.list_experiment_folders()
+            ],
+            value="experiments",
+            clearable=False,
+        ),
+        dbc.Label(
+            "Create another experiment folder",
+            className="mt-3",
+        ),
+        dbc.InputGroup(
+            [
+                dbc.Input(
+                    id="new-experiments-folder",
+                    placeholder="Example: experiment_fd001",
+                ),
+                dbc.Button(
+                    "Create and select",
+                    id="create-experiments-folder",
+                    color="secondary",
+                    outline=True,
+                ),
+            ]
+        ),
+        html.Div(
+            id="experiments-folder-status",
+            className="small mt-2",
         ),
         dbc.Label(
             "Experiment name",
@@ -1086,6 +1252,16 @@ development_results_section = html.Div(
             [
                 dbc.Col(
                     dcc.Graph(
+                        id="learning-curve-graph",
+                    ),
+                    lg=12,
+                ),
+            ]
+        ),
+        dbc.Row(
+            [
+                dbc.Col(
+                    dcc.Graph(
                         id="validation-prediction-graph",
                     ),
                     lg=6,
@@ -1213,9 +1389,10 @@ external_test_metric_cards = dbc.Row(
             metric_card(
                 "Official test NASA Score",
                 "external-nasa-score",
-                "Primary PHM Challenge evaluation metric (lower is better)",
+                "Primary PHM evaluation metric on official test motors.",
             ),
-            md=3,
+            md=4,
+            xl=2,
         ),
         dbc.Col(
             metric_card(
@@ -1223,7 +1400,8 @@ external_test_metric_cards = dbc.Row(
                 "external-mae",
                 "Average final RUL error per external motor",
             ),
-            md=3,
+            md=4,
+            xl=2,
         ),
         dbc.Col(
             metric_card(
@@ -1231,7 +1409,8 @@ external_test_metric_cards = dbc.Row(
                 "external-rmse",
                 "Final error with stronger penalty for large misses",
             ),
-            md=3,
+            md=4,
+            xl=2,
         ),
         dbc.Col(
             metric_card(
@@ -1239,19 +1418,22 @@ external_test_metric_cards = dbc.Row(
                 "external-r2",
                 "Variance explained on the official test motors",
             ),
-            md=3,
+            md=4,
+            xl=2,
         ),
         dbc.Col(
             metric_card(
-                "Official test Bias",
+                "Official test bias",
                 "external-bias",
                 "Positive means underprediction on average",
             ),
-            md=3,
+            md=4,
+            xl=2,
         ),
     ],
     className="g-3 mb-3",
 )
+
 
 official_test_section = html.Div(
     [
@@ -1346,14 +1528,42 @@ saved_section = html.Div(
         dbc.Row(
             [
                 dbc.Col(
-                    dcc.Dropdown(
-                        id="saved-experiment-selector",
-                        placeholder=(
-                            "Select one or more experiments"
+                    [
+                        dbc.Label(
+                            "Experiment folder",
+                            className="mb-1",
                         ),
-                        multi=True,
-                    ),
-                    lg=8,
+                        dcc.Dropdown(
+                            id="saved-experiments-folder",
+                            options=[
+                                {
+                                    "label": folder,
+                                    "value": folder,
+                                }
+                                for folder
+                                in SERVICE.list_experiment_folders()
+                            ],
+                            value="experiments",
+                            clearable=False,
+                        ),
+                    ],
+                    lg=4,
+                ),
+                dbc.Col(
+                    [
+                        dbc.Label(
+                            "Experiments",
+                            className="mb-1",
+                        ),
+                        dcc.Dropdown(
+                            id="saved-experiment-selector",
+                            placeholder=(
+                                "Select one or more experiments"
+                            ),
+                            multi=True,
+                        ),
+                    ],
+                    lg=4,
                 ),
                 dbc.Col(
                     dbc.Button(
@@ -1645,6 +1855,70 @@ app.layout = html.Div(
 # =====================================================================
 
 @callback(
+    Output("experiments-folder", "options"),
+    Output("experiments-folder", "value"),
+    Output("experiments-folder-status", "children"),
+    Output("saved-experiments-folder", "options"),
+    Input("create-experiments-folder", "n_clicks"),
+    State("new-experiments-folder", "value"),
+    State("experiments-folder", "value"),
+    prevent_initial_call=True,
+)
+def create_and_select_experiments_folder(
+    n_clicks,
+    new_folder,
+    current_folder,
+):
+    if not n_clicks:
+        raise PreventUpdate
+
+    try:
+        selected = SERVICE.select_experiments_folder(
+            new_folder or current_folder
+        ).name
+
+        folder_options = [
+            {
+                "label": folder,
+                "value": folder,
+            }
+            for folder
+            in SERVICE.list_experiment_folders()
+        ]
+
+        return (
+            folder_options,
+            selected,
+            dbc.Alert(
+                f"Using experiment folder '{selected}'.",
+                color="success",
+                className="py-1 mb-0",
+            ),
+            folder_options,
+        )
+    except Exception as exc:
+        folder_options = [
+            {
+                "label": folder,
+                "value": folder,
+            }
+            for folder
+            in SERVICE.list_experiment_folders()
+        ]
+
+        return (
+            folder_options,
+            current_folder,
+            dbc.Alert(
+                str(exc),
+                color="danger",
+                className="py-1 mb-0",
+            ),
+            folder_options,
+        )
+
+
+@callback(
     Output(
         "model-name",
         "options",
@@ -1749,6 +2023,7 @@ RUN_STATES = [
     State("model-family", "value"),
     State("model-name", "value"),
     State("experiment-name", "value"),
+    State("experiments-folder", "value"),
     State("columns-to-drop", "value"),
     State("feature-columns", "value"),
     State("model-params", "value"),
@@ -1781,6 +2056,7 @@ RUN_KEYS = [
     "model_family",
     "model_name",
     "experiment_name",
+    "experiments_folder",
     "columns_to_drop",
     "feature_columns",
     "model_params",
@@ -1835,6 +2111,10 @@ def create_run_config(
         "experiment_name": (
             state_values["experiment_name"]
             or None
+        ),
+        "experiments_folder": (
+            state_values["experiments_folder"]
+            or "experiments"
         ),
         "columns_to_drop": (
             parse_csv_names(
@@ -2001,6 +2281,10 @@ def create_run_config(
         "figure",
     ),
     Output(
+        "learning-curve-graph",
+        "figure",
+    ),
+    Output(
         "validation-prediction-graph",
         "figure",
     ),
@@ -2071,12 +2355,15 @@ def run_experiment(
             no_update,
             no_update,
             alert,
-            "—",
-            "—",
-            "—",
-            "—",
+            "—",  # Train NASA
+            "—",  # Validation NASA
+            "—",  # Train MAE
+            "—",  # Validation MAE
+            "—",  # Train RMSE
+            "—",  # Validation RMSE
             [],
             [],
+            empty,
             empty,
             empty,
             empty,
@@ -2105,6 +2392,9 @@ def run_experiment(
             "validation_predictions"
         )
         history = outcome.get("history")
+        learning_curve = outcome.get(
+            "learning_curve"
+        )
         experiment_name = outcome[
             "experiment_name"
         ]
@@ -2177,6 +2467,9 @@ def run_experiment(
                 "NASA_SCORE",
             ),
             history_figure(history),
+            learning_curve_figure(
+                learning_curve
+            ),
             prediction_figure(
                 validation_predictions,
                 "Validation: actual vs predicted RUL",
@@ -2237,6 +2530,7 @@ def run_experiment(
             empty,
             empty,
             empty,
+            empty,
         )
 
 
@@ -2250,10 +2544,13 @@ def run_experiment(
         "children",
     ),
     Output(
+        "external-nasa-score",
+        "children",
+    ),
+    Output(
         "external-mae",
         "children",
     ),
-    Output("external-nasa-score", "children"),
     Output(
         "external-rmse",
         "children",
@@ -2320,6 +2617,10 @@ def run_experiment(
         "value",
     ),
     State(
+        "experiments-folder",
+        "value",
+    ),
+    State(
         "external-test-datasets",
         "value",
     ),
@@ -2365,6 +2666,7 @@ def run_external_test(
     development_metrics: dict[str, Any] | None,
     validation_prediction_records: list[dict[str, Any]] | None,
     data_folder: str,
+    experiments_folder: str,
     datasets: list[str],
     rul_mode: str,
     custom_cap: int,
@@ -2384,10 +2686,11 @@ def run_external_test(
                 "Train or load an experiment before running the official test.",
                 color="warning",
             ),
-            "—",
-            "—",
-            "—",
-            "—",
+            "—",  # External NASA
+            "—",  # External MAE
+            "—",  # External RMSE
+            "—",  # External R2
+            "—",  # External bias
             [],
             [],
             empty,
@@ -2419,6 +2722,9 @@ def run_external_test(
             datasets=datasets,
             clip_rul=clip_rul,
             rul_cap=rul_cap,
+            experiments_folder=(
+                experiments_folder or "experiments"
+            ),
         )
 
         external_metrics = outcome[
@@ -2444,6 +2750,8 @@ def run_external_test(
                         for key, value
                         in external_metrics.items()
                         if key in {
+                            "NASA_SCORE",
+                            "MEAN_NASA_SCORE",
                             "MAE",
                             "RMSE",
                             "R2",
@@ -2564,6 +2872,9 @@ def run_external_test(
         return (
             status,
             format_metric(
+                external_metrics.get("NASA_SCORE")
+            ),
+            format_metric(
                 external_metrics.get("MAE")
             ),
             format_metric(
@@ -2575,7 +2886,6 @@ def run_external_test(
             format_metric(
                 external_metrics.get("Bias")
             ),
-            format_metric(external_metrics.get("NASA_SCORE")),
             external_frame.to_dict(
                 "records"
             ),
@@ -2588,7 +2898,7 @@ def run_external_test(
             ],
             metric_comparison_figure(
                 all_metrics,
-                "RMSE",
+                "NASA_SCORE",
             ),
             prediction_figure(
                 external_predictions,
@@ -2629,10 +2939,11 @@ def run_external_test(
                 ],
                 color="danger",
             ),
-            "—",
-            "—",
-            "—",
-            "—",
+            "—",  # External NASA
+            "—",  # External MAE
+            "—",  # External RMSE
+            "—",  # External R2
+            "—",  # External bias
             [],
             [],
             empty,
@@ -2990,6 +3301,32 @@ def preview_data(
 
 @callback(
     Output(
+        "saved-experiments-folder",
+        "value",
+    ),
+    Input(
+        "latest-experiment-name",
+        "data",
+    ),
+    Input(
+        "experiments-folder",
+        "value",
+    ),
+)
+def synchronize_saved_experiments_folder(
+    _latest_experiment_name,
+    experiments_folder,
+):
+    """
+    Keep the Saved experiments browser on the folder used by the latest run.
+
+    It also follows a manual change made in the experiment setup selector.
+    """
+    return experiments_folder or "experiments"
+
+
+@callback(
+    Output(
         "saved-experiment-selector",
         "options",
     ),
@@ -3013,10 +3350,15 @@ def preview_data(
         "latest-experiment-name",
         "data",
     ),
+    Input(
+        "saved-experiments-folder",
+        "value",
+    ),
 )
 def refresh_experiments(
     _n_clicks,
     _latest,
+    experiments_folder,
 ):
     if IMPORT_ERROR:
         return (
@@ -3028,7 +3370,9 @@ def refresh_experiments(
             ),
         )
 
-    comparison = SERVICE.list_experiments()
+    comparison = SERVICE.list_experiments(
+        experiments_folder=experiments_folder or "experiments"
+    )
 
     if comparison.empty:
         return (
@@ -3051,9 +3395,12 @@ def refresh_experiments(
     ]
 
     metric_column = (
-        "validation_RMSE"
-        if "validation_RMSE"
-        in comparison.columns
+        "external_test_NASA_SCORE"
+        if "external_test_NASA_SCORE" in comparison.columns
+        else "validation_NASA_SCORE"
+        if "validation_NASA_SCORE" in comparison.columns
+        else "validation_RMSE"
+        if "validation_RMSE" in comparison.columns
         else "external_test_RMSE"
         if "external_test_RMSE"
         in comparison.columns
@@ -3116,22 +3463,31 @@ def refresh_experiments(
         "saved-experiment-selector",
         "value",
     ),
+    State(
+        "saved-experiments-folder",
+        "value",
+    ),
     prevent_initial_call=True,
 )
 def compare_selected(
     experiment_names: list[str] | None,
+    experiments_folder: str,
 ):
     if not experiment_names:
         raise PreventUpdate
 
     comparison = SERVICE.compare_experiments(
-        experiment_names
+        experiment_names,
+        experiments_folder=experiments_folder or "experiments",
     )
 
     metric_column = (
-        "validation_RMSE"
-        if "validation_RMSE"
-        in comparison.columns
+        "external_test_NASA_SCORE"
+        if "external_test_NASA_SCORE" in comparison.columns
+        else "validation_NASA_SCORE"
+        if "validation_NASA_SCORE" in comparison.columns
+        else "validation_RMSE"
+        if "validation_RMSE" in comparison.columns
         else "external_test_RMSE"
         if "external_test_RMSE"
         in comparison.columns
@@ -3194,6 +3550,16 @@ def compare_selected(
         allow_duplicate=True,
     ),
     Output(
+        "train-nasa-score",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "validation-nasa-score",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
         "train-mae",
         "children",
         allow_duplicate=True,
@@ -3210,6 +3576,11 @@ def compare_selected(
     ),
     Output(
         "validation-rmse",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "external-nasa-score",
         "children",
         allow_duplicate=True,
     ),
@@ -3269,6 +3640,11 @@ def compare_selected(
         allow_duplicate=True,
     ),
     Output(
+        "learning-curve-graph",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Output(
         "validation-prediction-graph",
         "figure",
         allow_duplicate=True,
@@ -3296,18 +3672,24 @@ def compare_selected(
         "saved-experiment-selector",
         "value",
     ),
+    State(
+        "saved-experiments-folder",
+        "value",
+    ),
     prevent_initial_call=True,
 )
 def load_saved_experiment(
     n_clicks: int,
     selected: list[str] | None,
+    experiments_folder: str,
 ):
     if not n_clicks or not selected:
         raise PreventUpdate
 
     try:
         loaded = SERVICE.load_saved(
-            selected[0]
+            selected[0],
+            experiments_folder=experiments_folder or "experiments",
         )
 
         metrics = loaded["metrics"]
@@ -3321,6 +3703,9 @@ def load_saved_experiment(
             "external_test_predictions"
         )
         history = loaded.get("history")
+        learning_curve = loaded.get(
+            "learning_curve"
+        )
 
         train_values = split_metrics(
             metrics,
@@ -3368,6 +3753,12 @@ def load_saved_experiment(
             metrics,
             validation_records,
             format_metric(
+                train_values.get("NASA_SCORE")
+            ),
+            format_metric(
+                validation_values.get("NASA_SCORE")
+            ),
+            format_metric(
                 train_values.get("MAE")
             ),
             format_metric(
@@ -3378,6 +3769,9 @@ def load_saved_experiment(
             ),
             format_metric(
                 validation_values.get("RMSE")
+            ),
+            format_metric(
+                external_values.get("NASA_SCORE")
             ),
             format_metric(
                 external_values.get("MAE")
@@ -3418,13 +3812,16 @@ def load_saved_experiment(
                     "train": train_values,
                     "validation": validation_values,
                 },
-                "RMSE",
+                "NASA_SCORE",
             ),
             metric_comparison_figure(
                 metrics,
-                "RMSE",
+                "NASA_SCORE",
             ),
             history_figure(history),
+            learning_curve_figure(
+                learning_curve
+            ),
             prediction_figure(
                 validation_predictions,
                 "Validation: actual vs predicted RUL",
@@ -3456,18 +3853,22 @@ def load_saved_experiment(
             no_update,
             no_update,
             no_update,
-            "—",
-            "—",
-            "—",
-            "—",
-            "—",
-            "—",
-            "—",
-            "—",
+            "—",  # Train NASA
+            "—",  # Validation NASA
+            "—",  # Train MAE
+            "—",  # Validation MAE
+            "—",  # Train RMSE
+            "—",  # Validation RMSE
+            "—",  # External NASA
+            "—",  # External MAE
+            "—",  # External RMSE
+            "—",  # External R2
+            "—",  # External bias
             [],
             [],
             [],
             [],
+            empty,
             empty,
             empty,
             empty,

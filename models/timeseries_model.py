@@ -259,10 +259,20 @@ class SequenceRULModel:
 
         self._validate_configuration()
         self.preprocessor = (
-                            preprocessor
-                            if preprocessor is not None
-                            else CMapssPreprocessor()
+            preprocessor
+            if preprocessor is not None
+            else CMapssPreprocessor()
         )
+
+        # The preprocessor still receives the complete raw C-MAPSS input it
+        # needs, but exposes only the configured model features.
+        if (
+            self.feature_columns is not None
+            and hasattr(self.preprocessor, "set_params")
+        ):
+            self.preprocessor.set_params(
+                feature_columns=self.feature_columns
+            )
 
         self.fitted_preprocessor = None
         self.processed_feature_columns_: Optional[list[str]] = None
@@ -1765,6 +1775,47 @@ class SequenceRULModel:
     # ==========================================================
     # Visual diagnostics
     # ==========================================================
+
+    def get_learning_curve(self) -> pd.DataFrame:
+        """
+        Return the epoch-based train/validation learning curve.
+
+        Sequence models already record their learning process during model.fit,
+        so no additional model retraining is required.
+        """
+        if self.history is None:
+            raise RuntimeError(
+                "The model has not been trained."
+            )
+
+        history_values = getattr(
+            self.history,
+            "history",
+            self.history,
+        )
+
+        if not isinstance(
+            history_values,
+            dict,
+        ):
+            raise TypeError(
+                "The saved training history is not a metric dictionary."
+            )
+
+        frame = pd.DataFrame(
+            history_values
+        )
+
+        frame.insert(
+            0,
+            "epoch",
+            np.arange(
+                1,
+                len(frame) + 1,
+            ),
+        )
+
+        return frame
 
     def plot_training_history(
         self,
