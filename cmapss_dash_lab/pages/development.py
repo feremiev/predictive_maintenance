@@ -1960,6 +1960,9 @@ layout = html.Div(
             id="latest-experiment-name",
         ),
         dcc.Store(
+            id="training-completed-trigger",
+        ),
+        dcc.Store(
             id="latest-experiments-folder",
             data="experiments",
         ),
@@ -2112,7 +2115,7 @@ layout = html.Div(
         "n_clicks",
     ),
     Input(
-        "latest-experiment-name",
+        "training-completed-trigger",
         "data",
     ),
     State(
@@ -2128,7 +2131,7 @@ def update_development_section_state(
     _official_clicks,
     _saved_clicks,
     _data_clicks,
-    latest_experiment_name,
+    training_completed,
     current_state,
 ):
     state = {
@@ -2173,8 +2176,8 @@ def update_development_section_state(
     # saved experiment name. Expand every section so all results
     # become immediately available.
     if (
-        triggered_id == "latest-experiment-name"
-        and latest_experiment_name
+        triggered_id == "training-completed-trigger"
+        and training_completed
     ):
         return {
             key: True
@@ -2748,6 +2751,10 @@ def create_run_config(
         "data",
     ),
     Output(
+        "training-completed-trigger",
+        "data",
+    ),
+    Output(
         "latest-development-metrics",
         "data",
     ),
@@ -2874,6 +2881,7 @@ def run_experiment(
             no_update,
             no_update,
             no_update,
+            no_update,
             alert,
             "—",  # Train NASA
             "—",  # Validation NASA
@@ -2957,6 +2965,7 @@ def run_experiment(
                 "experiments_folder",
                 "experiments",
             ),
+            experiment_name,
             metrics,
             validation_records,
             status,
@@ -3036,6 +3045,7 @@ def run_experiment(
         )
 
         return (
+            no_update,
             no_update,
             no_update,
             no_update,
@@ -3901,7 +3911,7 @@ def _display_config_value(
     ),
     Input(
         "comparison-table",
-        "selected_rows",
+        "derived_virtual_selected_rows",
     ),
     State(
         "comparison-table",
@@ -4014,7 +4024,7 @@ def inspect_comparison_row(
         "value",
     ),
     Input(
-        "latest-experiment-name",
+        "training-completed-trigger",
         "data",
     ),
     Input(
@@ -4023,7 +4033,7 @@ def inspect_comparison_row(
     ),
 )
 def synchronize_saved_experiments_folder(
-    _latest_experiment_name,
+    _training_completed,
     experiments_folder,
 ):
     """
@@ -4051,12 +4061,16 @@ def synchronize_saved_experiments_folder(
         "comparison-graph",
         "figure",
     ),
+    Output(
+        "comparison-table",
+        "selected_rows",
+    ),
     Input(
         "refresh-experiments",
         "n_clicks",
     ),
     Input(
-        "latest-experiment-name",
+        "training-completed-trigger",
         "data",
     ),
     Input(
@@ -4066,7 +4080,7 @@ def synchronize_saved_experiments_folder(
 )
 def refresh_experiments(
     _n_clicks,
-    _latest,
+    _training_completed,
     experiments_folder,
 ):
     if IMPORT_ERROR:
@@ -4077,6 +4091,7 @@ def refresh_experiments(
             empty_figure(
                 "Experiment comparison"
             ),
+            [],
         )
 
     comparison = SERVICE.list_experiments(
@@ -4149,6 +4164,7 @@ def refresh_experiments(
             for column in comparison.columns
         ],
         figure,
+        [],
     )
 
 
@@ -4166,6 +4182,11 @@ def refresh_experiments(
     Output(
         "comparison-graph",
         "figure",
+        allow_duplicate=True,
+    ),
+    Output(
+        "comparison-table",
+        "selected_rows",
         allow_duplicate=True,
     ),
     Input(
@@ -4235,8 +4256,443 @@ def compare_selected(
             for column in comparison.columns
         ],
         figure,
+        [],
     )
 
+
+
+# =====================================================================
+# Saved experiment loading helpers
+# =====================================================================
+
+def _saved_value(
+    saved_config: dict[str, Any],
+    saved_metadata: dict[str, Any],
+    comparison_values: dict[str, Any],
+    *keys: str,
+    default=None,
+):
+    """Return the first stored non-None value for any supported key."""
+    for source_values in (
+        saved_config,
+        saved_metadata,
+        comparison_values,
+    ):
+        for key in keys:
+            value = source_values.get(key)
+            if value is not None:
+                return value
+
+    return default
+
+
+def _saved_setup_values(
+    loaded: dict[str, Any],
+    experiment_name: str,
+    experiments_folder: str,
+    comparison_values: dict[str, Any] | None = None,
+) -> tuple[Any, ...]:
+    """
+    Build the values used only by the Experiment setup controls.
+
+    This helper is used by "Load selected table model". It intentionally
+    does not update development or official-test results.
+    """
+    saved_experiment = loaded["loaded"]
+    saved_config = dict(
+        saved_experiment.config or {}
+    )
+    saved_metadata = dict(
+        getattr(
+            saved_experiment,
+            "metadata",
+            {},
+        )
+        or {}
+    )
+    comparison_values = dict(
+        comparison_values or {}
+    )
+
+    def value(
+        *keys: str,
+        default=None,
+    ):
+        return _saved_value(
+            saved_config,
+            saved_metadata,
+            comparison_values,
+            *keys,
+            default=default,
+        )
+
+    restored_model_family = str(
+        value(
+            "model_family",
+            "family",
+            default="tabular",
+        )
+    ).lower()
+
+    if restored_model_family in {
+        "sklearn",
+        "scikit-learn",
+        "scikit_learn",
+        "tabular",
+    }:
+        restored_model_family = "tabular"
+    elif restored_model_family in {
+        "tensorflow",
+        "keras",
+        "sequence",
+        "deep_learning",
+    }:
+        restored_model_family = "sequence"
+
+    restored_model_name = str(
+        value(
+            "model_name",
+            "model_type",
+            "estimator_name",
+            default=(
+                "lstm"
+                if restored_model_family == "sequence"
+                else "hist_gradient_boosting"
+            ),
+        )
+    ).lower()
+
+    valid_models = (
+        AVAILABLE_SEQUENCE_MODELS
+        if restored_model_family == "sequence"
+        else AVAILABLE_TABULAR_MODELS
+    )
+
+    if restored_model_name not in valid_models:
+        matching_models = sorted(
+            (
+                model
+                for model in valid_models
+                if model in experiment_name.lower()
+            ),
+            key=len,
+            reverse=True,
+        )
+
+        if matching_models:
+            restored_model_name = matching_models[0]
+
+    restored_data_folder = str(
+        value(
+            "data_folder",
+            "raw_data_folder",
+            default="raw_data",
+        )
+    )
+
+    restored_path = Path(
+        restored_data_folder
+    )
+
+    if restored_path.is_absolute():
+        restored_data_folder = (
+            restored_path.name
+        )
+
+    restored_datasets = value(
+        "datasets",
+        "training_datasets",
+        "dataset",
+        default=["FD001"],
+    )
+
+    if isinstance(
+        restored_datasets,
+        str,
+    ):
+        restored_datasets = [
+            restored_datasets
+        ]
+
+    columns_to_drop = value(
+        "columns_to_drop",
+        "excluded_columns",
+        "columns_to_exclude",
+        default=[],
+    )
+
+    if isinstance(
+        columns_to_drop,
+        str,
+    ):
+        columns_text = columns_to_drop
+    else:
+        columns_text = ",".join(
+            columns_to_drop or []
+        )
+
+    feature_columns = value(
+        "feature_columns",
+        "features",
+        default=None,
+    )
+
+    if isinstance(
+        feature_columns,
+        str,
+    ):
+        features_text = feature_columns
+    else:
+        features_text = (
+            ",".join(feature_columns)
+            if feature_columns
+            else ""
+        )
+
+    model_params = value(
+        "model_params",
+        "model_parameters",
+        "estimator_params",
+        default={},
+    )
+
+    return (
+        restored_data_folder,
+        restored_datasets,
+        bool(
+            value(
+                "remove_nulls",
+                default=True,
+            )
+        ),
+        bool(
+            value(
+                "clip_rul",
+                default=False,
+            )
+        ),
+        value(
+            "rul_cap",
+            "rul_clip_value",
+            default=125,
+        ),
+        value(
+            "target_column",
+            default="RUL",
+        ),
+        value(
+            "group_column",
+            "motor_column",
+            default="unique_motor_id",
+        ),
+        value(
+            "time_column",
+            "cycle_column",
+            default="cycle",
+        ),
+        restored_model_family,
+        restored_model_name,
+        experiment_name,
+        (
+            value(
+                "experiments_folder",
+                default=experiments_folder,
+            )
+            or "experiments"
+        ),
+        columns_text,
+        features_text,
+        json.dumps(
+            model_params or {},
+            indent=2,
+            default=str,
+        ),
+        int(
+            value(
+                "validation_group_count",
+                "validation_motor_count",
+                "validation_motors",
+                "n_validation_groups",
+                default=10,
+            )
+            or 10
+        ),
+        str(
+            value(
+                "group_selection",
+                "validation_group_selection",
+                "motor_selection",
+                default="random",
+            )
+            or "random"
+        ).lower(),
+        int(
+            value(
+                "random_state",
+                "seed",
+                "random_seed",
+                default=42,
+            )
+        ),
+        value(
+            "window_type",
+            default="sliding",
+        ),
+        value(
+            "window_size",
+            default=30,
+        ),
+        value(
+            "min_window_size",
+            default=10,
+        ),
+        value(
+            "max_window_size",
+            default=60,
+        ),
+        value(
+            "stride",
+            default=1,
+        ),
+        value(
+            "prediction_horizon",
+            default=0,
+        ),
+        value(
+            "scaler",
+            "scaler_name",
+            default="standard",
+        ),
+        value(
+            "epochs",
+            default=100,
+        ),
+        value(
+            "batch_size",
+            default=64,
+        ),
+        value(
+            "learning_rate",
+            default=0.001,
+        ),
+        value(
+            "patience",
+            default=12,
+        ),
+        value(
+            "loss",
+            default="huber",
+        ),
+        value(
+            "asymmetric_huber_late_weight",
+            default=2.5,
+        ),
+        value(
+            "asymmetric_huber_delta",
+            default=10.0,
+        ),
+        value(
+            "optimizer_clipnorm",
+            default=1.0,
+        ),
+    )
+
+
+def _combined_residual_figure(
+    validation_predictions: pd.DataFrame | None,
+    external_predictions: pd.DataFrame | None,
+) -> go.Figure:
+    """Compare validation and official-test residuals safely."""
+    figure = go.Figure()
+
+    for label, predictions, opacity in (
+        (
+            "Validation",
+            validation_predictions,
+            0.35,
+        ),
+        (
+            "Official test",
+            external_predictions,
+            0.70,
+        ),
+    ):
+        if (
+            not isinstance(
+                predictions,
+                pd.DataFrame,
+            )
+            or predictions.empty
+        ):
+            continue
+
+        frame = predictions.copy()
+
+        predicted_column = (
+            "predicted"
+            if "predicted" in frame.columns
+            else "predicted_RUL"
+            if "predicted_RUL" in frame.columns
+            else None
+        )
+
+        if predicted_column is None:
+            continue
+
+        if (
+            "residual" not in frame.columns
+            and "actual" in frame.columns
+        ):
+            frame["residual"] = (
+                frame["actual"]
+                - frame[predicted_column]
+            )
+
+        if {
+            predicted_column,
+            "residual",
+        }.issubset(frame.columns):
+            valid = frame[
+                [
+                    predicted_column,
+                    "residual",
+                ]
+            ].dropna()
+
+            if not valid.empty:
+                figure.add_trace(
+                    go.Scatter(
+                        x=valid[predicted_column],
+                        y=valid["residual"],
+                        mode="markers",
+                        name=label,
+                        opacity=opacity,
+                    )
+                )
+
+    if not figure.data:
+        return empty_figure(
+            "Validation vs official test residuals"
+        )
+
+    figure.add_hline(
+        y=0,
+        line_dash="dash",
+    )
+    figure.update_layout(
+        title=(
+            "Validation vs official test residuals"
+        ),
+        xaxis_title="Predicted RUL",
+        yaxis_title="Actual - predicted",
+    )
+
+    return figure
+
+
+# =====================================================================
+# Load the model selected directly from the comparison table
+# =====================================================================
 
 @callback(
     Output(
@@ -4251,131 +4707,6 @@ def compare_selected(
     Output(
         "latest-experiments-folder",
         "data",
-        allow_duplicate=True,
-    ),
-    Output(
-        "latest-development-metrics",
-        "data",
-        allow_duplicate=True,
-    ),
-    Output(
-        "latest-validation-predictions",
-        "data",
-        allow_duplicate=True,
-    ),
-    Output(
-        "train-nasa-score",
-        "children",
-        allow_duplicate=True,
-    ),
-    Output(
-        "validation-nasa-score",
-        "children",
-        allow_duplicate=True,
-    ),
-    Output(
-        "train-mae",
-        "children",
-        allow_duplicate=True,
-    ),
-    Output(
-        "validation-mae",
-        "children",
-        allow_duplicate=True,
-    ),
-    Output(
-        "train-rmse",
-        "children",
-        allow_duplicate=True,
-    ),
-    Output(
-        "validation-rmse",
-        "children",
-        allow_duplicate=True,
-    ),
-    Output(
-        "external-nasa-score",
-        "children",
-        allow_duplicate=True,
-    ),
-    Output(
-        "external-mae",
-        "children",
-        allow_duplicate=True,
-    ),
-    Output(
-        "external-rmse",
-        "children",
-        allow_duplicate=True,
-    ),
-    Output(
-        "external-r2",
-        "children",
-        allow_duplicate=True,
-    ),
-    Output(
-        "external-bias",
-        "children",
-        allow_duplicate=True,
-    ),
-    Output(
-        "development-metrics-table",
-        "data",
-        allow_duplicate=True,
-    ),
-    Output(
-        "development-metrics-table",
-        "columns",
-        allow_duplicate=True,
-    ),
-    Output(
-        "external-metrics-table",
-        "data",
-        allow_duplicate=True,
-    ),
-    Output(
-        "external-metrics-table",
-        "columns",
-        allow_duplicate=True,
-    ),
-    Output(
-        "development-metric-comparison",
-        "figure",
-        allow_duplicate=True,
-    ),
-    Output(
-        "all-splits-metric-comparison",
-        "figure",
-        allow_duplicate=True,
-    ),
-    Output(
-        "history-graph",
-        "figure",
-        allow_duplicate=True,
-    ),
-    Output(
-        "learning-curve-graph",
-        "figure",
-        allow_duplicate=True,
-    ),
-    Output(
-        "validation-prediction-graph",
-        "figure",
-        allow_duplicate=True,
-    ),
-    Output(
-        "validation-residual-graph",
-        "figure",
-        allow_duplicate=True,
-    ),
-    Output(
-        "external-prediction-graph",
-        "figure",
-        allow_duplicate=True,
-    ),
-    Output(
-        "external-residual-graph",
-        "figure",
         allow_duplicate=True,
     ),
     Output(
@@ -4544,20 +4875,12 @@ def compare_selected(
         allow_duplicate=True,
     ),
     Input(
-        "load-experiment",
-        "n_clicks",
-    ),
-    Input(
         "load-comparison-row",
         "n_clicks",
     ),
     State(
-        "saved-experiment-selector",
-        "value",
-    ),
-    State(
         "comparison-table",
-        "selected_rows",
+        "derived_virtual_selected_rows",
     ),
     State(
         "comparison-table",
@@ -4573,16 +4896,15 @@ def compare_selected(
     ),
     prevent_initial_call=True,
 )
-def load_saved_experiment(
-    dropdown_clicks: int,
-    table_clicks: int,
-    selected: list[str] | None,
+def load_comparison_table_model(
+    n_clicks: int,
     selected_rows,
     virtual_rows,
     table_rows,
     experiments_folder: str,
 ):
-    triggered_id = ctx.triggered_id
+    if not n_clicks:
+        raise PreventUpdate
 
     selected_row = _selected_comparison_row(
         selected_rows,
@@ -4590,17 +4912,12 @@ def load_saved_experiment(
         table_rows,
     )
 
-    if (
-        triggered_id == "load-comparison-row"
-        and selected_row
-    ):
-        experiment_name = selected_row.get(
-            "experiment_name"
-        )
-    elif selected:
-        experiment_name = selected[0]
-    else:
-        experiment_name = None
+    if not selected_row:
+        raise PreventUpdate
+
+    experiment_name = selected_row.get(
+        "experiment_name"
+    )
 
     if not experiment_name:
         raise PreventUpdate
@@ -4608,15 +4925,255 @@ def load_saved_experiment(
     try:
         loaded = SERVICE.load_saved(
             experiment_name,
-            experiments_folder=experiments_folder or "experiments",
+            experiments_folder=(
+                experiments_folder
+                or "experiments"
+            ),
         )
 
-        saved_experiment = loaded["loaded"]
-        saved_config = dict(
-            saved_experiment.config or {}
+        setup_values = _saved_setup_values(
+            loaded,
+            experiment_name,
+            experiments_folder or "experiments",
+            selected_row,
         )
 
-        metrics = loaded["metrics"]
+        return (
+            dbc.Alert(
+                (
+                    f"Loaded model '{experiment_name}'. "
+                    "Experiment setup was restored."
+                ),
+                color="success",
+            ),
+            experiment_name,
+            experiments_folder or "experiments",
+            *setup_values,
+        )
+
+    except Exception as exc:
+        return (
+            dbc.Alert(
+                f"{type(exc).__name__}: {exc}",
+                color="danger",
+            ),
+            no_update,
+            no_update,
+            *(
+                no_update
+                for _ in range(33)
+            ),
+        )
+
+
+# =====================================================================
+# Reload the selected experiment results
+# =====================================================================
+
+@callback(
+    Output(
+        "load-status",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "latest-experiment-name",
+        "data",
+        allow_duplicate=True,
+    ),
+    Output(
+        "latest-experiments-folder",
+        "data",
+        allow_duplicate=True,
+    ),
+    Output(
+        "latest-development-metrics",
+        "data",
+        allow_duplicate=True,
+    ),
+    Output(
+        "latest-validation-predictions",
+        "data",
+        allow_duplicate=True,
+    ),
+    Output(
+        "train-nasa-score",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "validation-nasa-score",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "train-mae",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "validation-mae",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "train-rmse",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "validation-rmse",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "development-metrics-table",
+        "data",
+        allow_duplicate=True,
+    ),
+    Output(
+        "development-metrics-table",
+        "columns",
+        allow_duplicate=True,
+    ),
+    Output(
+        "development-metric-comparison",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Output(
+        "history-graph",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Output(
+        "learning-curve-graph",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Output(
+        "validation-prediction-graph",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Output(
+        "validation-residual-graph",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Output(
+        "train-residual-graph",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Output(
+        "validation-error-distribution",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Output(
+        "external-nasa-score",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "external-mae",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "external-rmse",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "external-r2",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "external-bias",
+        "children",
+        allow_duplicate=True,
+    ),
+    Output(
+        "external-metrics-table",
+        "data",
+        allow_duplicate=True,
+    ),
+    Output(
+        "external-metrics-table",
+        "columns",
+        allow_duplicate=True,
+    ),
+    Output(
+        "all-splits-metric-comparison",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Output(
+        "external-prediction-graph",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Output(
+        "external-residual-graph",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Output(
+        "external-error-distribution",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Output(
+        "validation-vs-external-residuals",
+        "figure",
+        allow_duplicate=True,
+    ),
+    Input(
+        "load-experiment",
+        "n_clicks",
+    ),
+    State(
+        "saved-experiment-selector",
+        "value",
+    ),
+    State(
+        "saved-experiments-folder",
+        "value",
+    ),
+    prevent_initial_call=True,
+)
+def reload_selected_experiment_results(
+    n_clicks: int,
+    selected: list[str] | None,
+    experiments_folder: str,
+):
+    if not n_clicks or not selected:
+        raise PreventUpdate
+
+    experiment_name = selected[0]
+    active_folder = (
+        experiments_folder
+        or "experiments"
+    )
+
+    empty = empty_figure(
+        "No results available"
+    )
+
+    try:
+        loaded = SERVICE.load_saved(
+            experiment_name,
+            experiments_folder=active_folder,
+        )
+
+        metrics = loaded.get(
+            "metrics",
+            {},
+        ) or {}
+
         train_predictions = loaded.get(
             "train_predictions"
         )
@@ -4626,7 +5183,9 @@ def load_saved_experiment(
         external_predictions = loaded.get(
             "external_test_predictions"
         )
-        history = loaded.get("history")
+        history = loaded.get(
+            "history"
+        )
         learning_curve = loaded.get(
             "learning_curve"
         )
@@ -4668,401 +5227,66 @@ def load_saved_experiment(
             else None
         )
 
-        saved_metadata = dict(
-            getattr(
-                saved_experiment,
-                "metadata",
-                {},
-            )
-            or {}
-        )
-
-        comparison_values = dict(
-            selected_row or {}
-        )
-
-        def saved_value(
-            *keys,
-            default=None,
-        ):
-            """
-            Read the first meaningful value from the saved configuration,
-            experiment metadata, or selected comparison-table row.
-            """
-            for source_values in (
-                saved_config,
-                saved_metadata,
-                comparison_values,
-            ):
-                for key in keys:
-                    value = source_values.get(
-                        key
-                    )
-
-                    if value is not None:
-                        return value
-
-            return default
-
-        restored_model_family = str(
-            saved_value(
-                "model_family",
-                "family",
-                default="tabular",
-            )
-        ).lower()
-
-        if restored_model_family in {
-            "sklearn",
-            "scikit-learn",
-            "scikit_learn",
-            "tabular",
-        }:
-            restored_model_family = "tabular"
-
-        elif restored_model_family in {
-            "tensorflow",
-            "keras",
-            "sequence",
-            "deep_learning",
-        }:
-            restored_model_family = "sequence"
-
-        else:
-            model_candidate = str(
-                saved_value(
-                    "model_name",
-                    "model_type",
-                    default="",
-                )
-            ).lower()
-
-            restored_model_family = (
-                "sequence"
-                if model_candidate
-                in AVAILABLE_SEQUENCE_MODELS
-                else "tabular"
-            )
-
-        restored_model_name = str(
-            saved_value(
-                "model_name",
-                "model_type",
-                "estimator_name",
-                default=(
-                    "lstm"
-                    if restored_model_family
-                    == "sequence"
-                    else "hist_gradient_boosting"
-                ),
-            )
-        ).lower()
-
-        # Older experiment files may only expose the model through the
-        # experiment name. Recover it when no valid model key was saved.
-        valid_models = (
-            AVAILABLE_SEQUENCE_MODELS
-            if restored_model_family
-            == "sequence"
-            else AVAILABLE_TABULAR_MODELS
-        )
-
-        if restored_model_name not in valid_models:
-            lowered_experiment_name = (
-                experiment_name.lower()
-            )
-
-            matching_models = sorted(
-                (
-                    model
-                    for model in valid_models
-                    if model
-                    in lowered_experiment_name
-                ),
-                key=len,
-                reverse=True,
-            )
-
-            if matching_models:
-                restored_model_name = (
-                    matching_models[0]
-                )
-
-        restored_feature_columns = saved_value(
-            "feature_columns",
-            "features",
-            default=None,
-        )
-
-        restored_columns_to_drop = saved_value(
-            "columns_to_drop",
-            "excluded_columns",
-            "columns_to_exclude",
-            default=[],
-        )
-
-        restored_model_params = saved_value(
-            "model_params",
-            "model_parameters",
-            "estimator_params",
-            default={},
-        )
-
-        restored_data_folder = str(
-            saved_value(
-                "data_folder",
-                "raw_data_folder",
-                default="raw_data",
+        combined_residuals = (
+            _combined_residual_figure(
+                validation_predictions,
+                external_predictions,
             )
         )
 
-        # Experiments store the resolved absolute path for reproducibility.
-        # The interface should display the original usable folder name.
-        restored_data_path = Path(
-            restored_data_folder
+        has_external_results = bool(
+            external_values
         )
 
-        if restored_data_path.is_absolute():
-            restored_data_folder = (
-                restored_data_path.name
+        status_message = (
+            f"Reloaded saved results for "
+            f"'{experiment_name}'."
+        )
+
+        if not has_external_results:
+            status_message += (
+                " This experiment does not contain "
+                "saved official-test results."
             )
-
-        restored_datasets = saved_value(
-            "datasets",
-            "training_datasets",
-            "dataset",
-            default=["FD001"],
-        )
-
-        if isinstance(
-            restored_datasets,
-            str,
-        ):
-            restored_datasets = [
-                restored_datasets
-            ]
-
-        restored_validation_count = saved_value(
-            "validation_group_count",
-            "validation_motor_count",
-            "validation_motors",
-            "n_validation_groups",
-            default=10,
-        )
-
-        restored_group_selection = saved_value(
-            "group_selection",
-            "validation_group_selection",
-            "motor_selection",
-            default="random",
-        )
-
-        restored_random_state = saved_value(
-            "random_state",
-            "seed",
-            "random_seed",
-            default=42,
-        )
-
-        if isinstance(
-            restored_columns_to_drop,
-            str,
-        ):
-            restored_columns_text = (
-                restored_columns_to_drop
-            )
-        else:
-            restored_columns_text = ",".join(
-                restored_columns_to_drop
-                or []
-            )
-
-        if isinstance(
-            restored_feature_columns,
-            str,
-        ):
-            restored_features_text = (
-                restored_feature_columns
-            )
-        else:
-            restored_features_text = (
-                ",".join(
-                    restored_feature_columns
-                )
-                if restored_feature_columns
-                else ""
-            )
-
-        setup_values = (
-            restored_data_folder,
-            restored_datasets,
-            bool(
-                saved_value(
-                    "remove_nulls",
-                    default=True,
-                )
-            ),
-            bool(
-                saved_value(
-                    "clip_rul",
-                    default=False,
-                )
-            ),
-            saved_value(
-                "rul_cap",
-                "rul_clip_value",
-                default=125,
-            ),
-            saved_value(
-                "target_column",
-                default="RUL",
-            ),
-            saved_value(
-                "group_column",
-                "motor_column",
-                default="unique_motor_id",
-            ),
-            saved_value(
-                "time_column",
-                "cycle_column",
-                default="cycle",
-            ),
-            restored_model_family,
-            restored_model_name,
-            experiment_name,
-            (
-                saved_value(
-                    "experiments_folder",
-                    default=experiments_folder,
-                )
-                or "experiments"
-            ),
-            restored_columns_text,
-            restored_features_text,
-            json.dumps(
-                restored_model_params
-                or {},
-                indent=2,
-                default=str,
-            ),
-            int(
-                restored_validation_count
-                or 10
-            ),
-            str(
-                restored_group_selection
-                or "random"
-            ).lower(),
-            int(
-                restored_random_state
-                if restored_random_state
-                is not None
-                else 42
-            ),
-            saved_value(
-                "window_type",
-                default="sliding",
-            ),
-            saved_value(
-                "window_size",
-                default=30,
-            ),
-            saved_value(
-                "min_window_size",
-                default=10,
-            ),
-            saved_value(
-                "max_window_size",
-                default=60,
-            ),
-            saved_value(
-                "stride",
-                default=1,
-            ),
-            saved_value(
-                "prediction_horizon",
-                default=0,
-            ),
-            saved_value(
-                "scaler",
-                "scaler_name",
-                default="standard",
-            ),
-            saved_value(
-                "epochs",
-                default=100,
-            ),
-            saved_value(
-                "batch_size",
-                default=64,
-            ),
-            saved_value(
-                "learning_rate",
-                default=0.001,
-            ),
-            saved_value(
-                "patience",
-                default=12,
-            ),
-            saved_value(
-                "loss",
-                default="huber",
-            ),
-            saved_value(
-                "asymmetric_huber_late_weight",
-                default=2.5,
-            ),
-            saved_value(
-                "asymmetric_huber_delta",
-                default=10.0,
-            ),
-            saved_value(
-                "optimizer_clipnorm",
-                default=1.0,
-            ),
-        )
 
         return (
             dbc.Alert(
-                f"Loaded '{experiment_name}'.",
+                status_message,
                 color="success",
             ),
             experiment_name,
-            experiments_folder or "experiments",
+            active_folder,
             metrics,
             validation_records,
             format_metric(
-                train_values.get("NASA_SCORE")
+                train_values.get(
+                    "NASA_SCORE"
+                )
             ),
             format_metric(
-                validation_values.get("NASA_SCORE")
+                validation_values.get(
+                    "NASA_SCORE"
+                )
             ),
             format_metric(
-                train_values.get("MAE")
+                train_values.get(
+                    "MAE"
+                )
             ),
             format_metric(
-                validation_values.get("MAE")
+                validation_values.get(
+                    "MAE"
+                )
             ),
             format_metric(
-                train_values.get("RMSE")
+                train_values.get(
+                    "RMSE"
+                )
             ),
             format_metric(
-                validation_values.get("RMSE")
-            ),
-            format_metric(
-                external_values.get("NASA_SCORE")
-            ),
-            format_metric(
-                external_values.get("MAE")
-            ),
-            format_metric(
-                external_values.get("RMSE")
-            ),
-            format_metric(
-                external_values.get("R2")
-            ),
-            format_metric(
-                external_values.get("Bias")
+                validation_values.get(
+                    "RMSE"
+                )
             ),
             development_frame.to_dict(
                 "records"
@@ -5075,6 +5299,60 @@ def load_saved_experiment(
                 for column
                 in development_frame.columns
             ],
+            metric_comparison_figure(
+                {
+                    "train": train_values,
+                    "validation": validation_values,
+                },
+                "NASA_SCORE",
+            ),
+            history_figure(
+                history
+            ),
+            learning_curve_figure(
+                learning_curve
+            ),
+            prediction_figure(
+                validation_predictions,
+                "Validation: actual vs predicted RUL",
+            ),
+            residual_figure(
+                validation_predictions,
+                "Validation residuals",
+            ),
+            residual_figure(
+                train_predictions,
+                "Training residuals",
+            ),
+            error_distribution_figure(
+                validation_predictions,
+                "Validation error distribution",
+            ),
+            format_metric(
+                external_values.get(
+                    "NASA_SCORE"
+                )
+            ),
+            format_metric(
+                external_values.get(
+                    "MAE"
+                )
+            ),
+            format_metric(
+                external_values.get(
+                    "RMSE"
+                )
+            ),
+            format_metric(
+                external_values.get(
+                    "R2"
+                )
+            ),
+            format_metric(
+                external_values.get(
+                    "Bias"
+                )
+            ),
             external_frame.to_dict(
                 "records"
             ),
@@ -5087,27 +5365,8 @@ def load_saved_experiment(
                 in external_frame.columns
             ],
             metric_comparison_figure(
-                {
-                    "train": train_values,
-                    "validation": validation_values,
-                },
-                "NASA_SCORE",
-            ),
-            metric_comparison_figure(
                 metrics,
                 "NASA_SCORE",
-            ),
-            history_figure(history),
-            learning_curve_figure(
-                learning_curve
-            ),
-            prediction_figure(
-                validation_predictions,
-                "Validation: actual vs predicted RUL",
-            ),
-            residual_figure(
-                validation_predictions,
-                "Validation residuals",
             ),
             prediction_figure(
                 external_predictions,
@@ -5117,36 +5376,46 @@ def load_saved_experiment(
                 external_predictions,
                 "Official test residuals",
             ),
-            *setup_values,
+            error_distribution_figure(
+                external_predictions,
+                "Official test error distribution",
+            ),
+            combined_residuals,
         )
 
     except Exception as exc:
-        empty = empty_figure(
-            "No results available"
-        )
+        trace = traceback.format_exc()
 
         return (
             dbc.Alert(
-                f"{type(exc).__name__}: {exc}",
+                [
+                    html.Strong(
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    html.Details(
+                        [
+                            html.Summary(
+                                "Show traceback"
+                            ),
+                            html.Pre(
+                                trace,
+                                className="traceback",
+                            ),
+                        ]
+                    ),
+                ],
                 color="danger",
             ),
             no_update,
             no_update,
             no_update,
             no_update,
-            "—",  # Train NASA
-            "—",  # Validation NASA
-            "—",  # Train MAE
-            "—",  # Validation MAE
-            "—",  # Train RMSE
-            "—",  # Validation RMSE
-            "—",  # External NASA
-            "—",  # External MAE
-            "—",  # External RMSE
-            "—",  # External R2
-            "—",  # External bias
-            [],
-            [],
+            "—",
+            "—",
+            "—",
+            "—",
+            "—",
+            "—",
             [],
             [],
             empty,
@@ -5156,9 +5425,16 @@ def load_saved_experiment(
             empty,
             empty,
             empty,
+            "—",
+            "—",
+            "—",
+            "—",
+            "—",
+            [],
+            [],
             empty,
-            *(
-                no_update
-                for _ in range(33)
-            ),
+            empty,
+            empty,
+            empty,
+            empty,
         )
